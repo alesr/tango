@@ -106,10 +106,9 @@ The system uses `sync.Map` for thread-safe storage of players and matches, ensur
 
 ## Future Enhancements
 
-- Match Filtering: Add advanced filtering options based on tags or player preferences.
-- Load Balancing: Distribute players across multiple matches more evenly when there are many hosting players.
-- Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
-- Improve test coverage.
-- Memory profilling.
-- CI.
-- Use `sync.Pool` is used to manage matches.
+	•	Match Filtering: Add advanced filtering options based on tags or player preferences.
+	•	- Load Balancing: Distribute players across multiple matches more evenly when there are many hosting players.
+	•	- Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
+	•	- Improve test coverage.
+	•	- Memory profilling.
+	•	- Use `sync.Pool` is used to manage matches.
