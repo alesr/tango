@@ -1,5 +1,7 @@
 # Tango: Matchmaking System
 
+[![codecov](https://codecov.io/gh/alesr/tango/branch/main/graph/badge.svg)](https://codecov.io/gh/alesr/tango)
+
 Tango is a simple matchmaking system for players looking to host or join matches in different game modes. It handles queueing players, creating matches, managing available slots, and removing players when necessary. Tango is designed for flexibility and efficiency, supporting multiple game modes (such as 1v1, 2v2, and 3v3) and ensuring thread safety with `sync.Map` and atomic operations.
 
 ## Features
