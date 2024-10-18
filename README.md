@@ -97,13 +97,9 @@ A Player contains:
 	•	GameMode: The game mode the player is interested in.
 	•	Deadline: The time after which the player should be removed from the system if not matched.
 
-### Atomic Operations
-
-Atomic operations are used to efficiently manage the available slots in matches. For example, when a player joins or leaves a match, the slot count is updated using atomic.AddInt32.
-
 ### Concurrency
 
-The system uses sync.Map for thread-safe storage of players and matches, ensuring that operations like player enqueueing, match creation, and player removal can be done concurrently without race conditions.
+The system uses `sync.Map` for thread-safe storage of players and matches, ensuring that operations like player enqueueing, match creation, and player removal can be done concurrently without race conditions.
 
 
 ## Future Enhancements
@@ -113,4 +109,5 @@ The system uses sync.Map for thread-safe storage of players and matches, ensurin
 - Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
 - Improve test coverage.
 - Memory profilling.
-- CI
+- CI.
+- Use `sync.Pool` is used to manage matches.
