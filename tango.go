@@ -4,7 +4,6 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -14,26 +13,18 @@ const (
 	GameMode1v1 GameMode = "1v1"
 	GameMode2v2 GameMode = "2v2"
 	GameMode3v3 GameMode = "3v3"
+
+	attemptToJoinMatchFrequency = time.Millisecond * 500
+	checkDeadlinesFrequency     = time.Second
 )
 
 type Match struct {
 	hostPlayerIP   string
 	joinedPlayers  sync.Map
-	availableSlots int32
+	availableSlots int
 	tags           []string
 	gameMode       GameMode
-}
-
-func (m *Match) getAvailableSlots() int32 {
-	return atomic.LoadInt32(&m.availableSlots)
-}
-
-func (m *Match) decrementSlots() {
-	atomic.AddInt32(&m.availableSlots, -1)
-}
-
-func (m *Match) incrementSlots() {
-	atomic.AddInt32(&m.availableSlots, +1)
+	mu             sync.RWMutex
 }
 
 type Player struct {
@@ -49,6 +40,7 @@ type Tango struct {
 	players     sync.Map
 	matches     sync.Map
 	playerQueue chan Player
+	mu          sync.Mutex
 }
 
 // New creates a new Tango instance.
@@ -103,8 +95,13 @@ func (t *Tango) RemovePlayer(playerIP string) error {
 }
 
 func (t *Tango) findMatchForPlayer(playerIP string) (*Match, bool) {
-	var matchToRemove *Match
-	var isHost bool
+	var (
+		matchToRemove *Match
+		isHost        bool
+	)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	t.matches.Range(func(_, value any) bool {
 		match := value.(*Match)
@@ -115,9 +112,12 @@ func (t *Tango) findMatchForPlayer(playerIP string) (*Match, bool) {
 			return false
 		}
 
+		match.mu.Lock()
+		defer match.mu.Unlock()
+
 		if _, ok := match.joinedPlayers.Load(playerIP); ok {
 			match.joinedPlayers.Delete(playerIP)
-			match.incrementSlots()
+			match.availableSlots++
 
 			if match.availableSlots == availableSlotsPerGameMode(match.gameMode) {
 				matchToRemove = match
@@ -143,22 +143,24 @@ func (t *Tango) removeMatch(hostPlayerIP string) error {
 	match, _ := t.matches.Load(hostPlayerIP)
 	matchInstance := match.(*Match)
 
+	// Lock before accessing joinedPlayers
+	matchInstance.mu.Lock()
+	defer matchInstance.mu.Unlock()
+
 	// Remove each player from the players map
 	matchInstance.joinedPlayers.Range(func(key, _ any) bool {
 		playerIP := key.(string)
-		t.players.Delete(playerIP) // Remove player from players map
-		t.logger.Info("Player removed from match due to host leaving", slog.String("playerIP", playerIP))
-		return true // Continue iteration
+		t.players.Delete(playerIP)
+		return true
 	})
 
-	// Finally remove the match itself
 	t.matches.Delete(hostPlayerIP)
-	t.players.Delete(hostPlayerIP) // Optionally remove the host player too
+	t.players.Delete(hostPlayerIP)
 
 	return nil
 }
 
-func availableSlotsPerGameMode(gm GameMode) int32 {
+func availableSlotsPerGameMode(gm GameMode) int {
 	switch gm {
 	case GameMode1v1:
 		return 1
@@ -181,7 +183,8 @@ func (t *Tango) processQueue() {
 
 func (t *Tango) attemptToJoinMatch(player Player) {
 	deadline := time.After(time.Until(player.Deadline))
-	ticker := time.NewTicker(100 * time.Millisecond)
+
+	ticker := time.NewTicker(attemptToJoinMatchFrequency)
 	defer ticker.Stop()
 
 	for {
@@ -198,14 +201,20 @@ func (t *Tango) attemptToJoinMatch(player Player) {
 }
 
 func (t *Tango) tryJoinMatch(player Player) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	var matchFound bool
 
 	t.matches.Range(func(_, value any) bool {
 		match := value.(*Match)
 
-		if match.gameMode == player.GameMode && match.getAvailableSlots() > 0 {
+		match.mu.Lock()
+		defer match.mu.Unlock()
+
+		if match.gameMode == player.GameMode && match.availableSlots > 0 {
 			match.joinedPlayers.Store(player.IP, player)
-			atomic.AddInt32(&match.availableSlots, -1)
+			match.availableSlots--
 			matchFound = true
 			return false
 		}
@@ -219,12 +228,11 @@ func (t *Tango) tryJoinMatch(player Player) bool {
 }
 
 func (t *Tango) handlePlayerTimeout(player Player) {
-	t.logger.Info("Player timeout", slog.String("playerIP", player.IP))
 	t.RemovePlayer(player.IP)
 }
 
 func (t *Tango) checkDeadlines() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(checkDeadlinesFrequency)
 	defer ticker.Stop()
 
 	for range ticker.C {
