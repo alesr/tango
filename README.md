@@ -2,7 +2,7 @@
 
 [![codecov](https://codecov.io/gh/alesr/tango/branch/main/graph/badge.svg)](https://codecov.io/gh/alesr/tango)
 
-Tango is a simple matchmaking system for players looking to host or join matches in different game modes. It handles queueing players, creating matches, managing available slots, and removing players when necessary. Tango is designed for flexibility and efficiency, supporting multiple game modes (such as 1v1, 2v2, and 3v3) and ensuring thread safety with `sync.Map` and atomic operations.
+Tango is a simple matchmaking system for players looking to host or join matches in different game modes. It handles queueing players, creating matches, managing available slots, and removing players when necessary. Tango is designed for flexibility and efficiency, supporting multiple game modes (such as 1v1, 2v2, and 3v3).
 
 ## Features
 
@@ -11,7 +11,6 @@ Tango is a simple matchmaking system for players looking to host or join matches
 - **Match Joining**: Non-hosting players attempt to join matches with compatible game modes and available slots.
 - **Player Timeout**: Players are automatically removed from the queue or match if their deadline expires.
 - **Automatic Cleanup**: When a host player leaves, all players in the match are removed, and the match is deleted.
-- **Thread Safety**: `sync.Map` is used for concurrent player and match management, ensuring that the system handles high concurrency gracefully.
 
 ## Game Modes
 
@@ -99,16 +98,12 @@ A Player contains:
 	•	GameMode: The game mode the player is interested in.
 	•	Deadline: The time after which the player should be removed from the system if not matched.
 
-### Concurrency
-
-The system uses `sync.Map` for thread-safe storage of players and matches, ensuring that operations like player enqueueing, match creation, and player removal can be done concurrently without race conditions.
-
 
 ## Future Enhancements
 
 	•	Match Filtering: Add advanced filtering options based on tags or player preferences.
-	•	- Load Balancing: Distribute players across multiple matches more evenly when there are many hosting players.
-	•	- Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
-	•	- Improve test coverage.
-	•	- Memory profilling.
-	•	- Use `sync.Pool` is used to manage matches.
+	•	Load Balancing: Distribute players across multiple matches more evenly when there are many hosting players.
+	•	Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
+	•	Improve test coverage.
+	•	Memory profilling.
+	•	Use `sync.Pool` is used to manage matches.
