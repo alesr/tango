@@ -40,20 +40,25 @@ func TestTangoMatchmaking(t *testing.T) {
 		require.NoError(t, tango.Enqueue(joiningPlayer))
 
 		// Wait for the matchmaking process to complete
-		time.Sleep(1 * time.Second)
+		sleep()
 
-		match, hostFound := tango.matches.Load(hostPlayer.IP)
+		m, hostFound := tango.matches.Load(hostPlayer.IP)
 		require.True(t, hostFound, "hosting player not found in match")
 
-		assert.NotNil(t, match, "match should not be nil")
-		assert.Equal(t, hostPlayer.IP, match.(*Match).hostPlayerIP, "host player IP does not match")
-		assert.Equal(t, hostPlayer.GameMode, match.(*Match).gameMode, "game mode does not match")
-		assert.ElementsMatch(t, hostPlayer.Tags, match.(*Match).tags, "tags do not match")
+		match := m.(*Match)
 
-		_, playerFound := match.(*Match).joinedPlayers.Load(joiningPlayer.IP)
+		assert.NotNil(t, match, "match should not be nil")
+		assert.Equal(t, hostPlayer.IP, match.hostPlayerIP, "host player IP does not match")
+		assert.Equal(t, hostPlayer.GameMode, match.gameMode, "game mode does not match")
+		assert.ElementsMatch(t, hostPlayer.Tags, match.tags, "tags do not match")
+
+		_, playerFound := match.joinedPlayers.Load(joiningPlayer.IP)
 		assert.True(t, playerFound, "player not found in match")
 
-		assert.Equal(t, int32(0), match.(*Match).getAvailableSlots(), "expected available slots to be 0")
+		match.mu.RLock()
+		defer match.mu.RUnlock()
+
+		assert.Equal(t, 0, match.availableSlots, "expected available slots to be 0")
 	})
 
 	t.Run("Remove Players", func(t *testing.T) {
@@ -65,7 +70,7 @@ func TestTangoMatchmaking(t *testing.T) {
 		require.NoError(t, tango.Enqueue(hostPlayer))
 		require.NoError(t, tango.Enqueue(joiningPlayer))
 
-		time.Sleep(1 * time.Second)
+		sleep()
 
 		// Remove joining player
 		require.NoError(t, tango.RemovePlayer(joiningPlayer.IP))
@@ -94,7 +99,7 @@ func TestTangoMatchmaking(t *testing.T) {
 
 		require.NoError(t, tango.Enqueue(hostPlayer))
 
-		time.Sleep(1 * time.Second)
+		sleep()
 
 		// Validate that the match exists again
 		_, hostFound := tango.matches.Load(hostPlayer.IP)
@@ -123,8 +128,7 @@ func TestTangoMatchmaking(t *testing.T) {
 
 		require.NoError(t, tango.Enqueue(hostPlayer))
 
-		// Wait for the matchmaking process to complete
-		time.Sleep(1 * time.Second)
+		sleep()
 
 		// Check if the match is listed correctly
 		matches := tango.ListMatches()
@@ -163,6 +167,122 @@ func TestTangoMatchmaking(t *testing.T) {
 	})
 }
 
+func TestTangoMultiplePlayers(t *testing.T) {
+	t.Parallel()
+
+	hosts := []Player{
+		{IP: "host1", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "host2", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "host3", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
+	}
+
+	players := []Player{
+		{IP: "player1", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "player2", Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "player3", Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "player4", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
+		{IP: "timeout_player", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(1 * time.Second)},
+	}
+
+	t.Run("Enqueue Players and Hosts", func(t *testing.T) {
+		t.Parallel()
+
+		logger := noopLogger()
+		tango := New(logger, 10)
+
+		for _, host := range hosts {
+			require.NoError(t, tango.Enqueue(host))
+		}
+
+		for _, player := range players {
+			require.NoError(t, tango.Enqueue(player))
+		}
+
+		// Wait longer for all players to potentially join matches
+		time.Sleep(2 * time.Second)
+
+		// Check matches for hosts
+		for _, host := range hosts {
+			match, found := tango.matches.Load(host.IP)
+			require.True(t, found, "host not found in match")
+			assert.NotNil(t, match, "match should not be nil")
+		}
+
+		// Check for players in matches
+		for _, player := range players {
+			var matchFound bool
+			for _, host := range hosts {
+				// Load the match from the sync.Map
+				if match, playerFound := tango.matches.Load(host.IP); playerFound {
+					// Check if the player is in the joinedPlayers map of the match
+					if _, found := match.(*Match).joinedPlayers.Load(player.IP); found {
+						matchFound = true
+						break
+					}
+				}
+			}
+
+			if player.IP == "timeout_player" {
+				_, found := tango.players.Load(players[4].IP)
+				assert.False(t, found, "timeout player should not be found after deadline timeout")
+
+				assert.False(t, matchFound, "player %s found in a match", player.IP)
+			} else {
+				assert.True(t, matchFound, "player %s not found in any match", player.IP)
+			}
+		}
+	})
+
+	t.Run("No Available Matches", func(t *testing.T) {
+		t.Parallel()
+
+		logger := noopLogger()
+		tango := New(logger, 10)
+
+		noMatchPlayer := Player{
+			IP:       "no_match_player",
+			Tags:     []string{"tag"},
+			GameMode: GameMode3v3, // No match available for this mode
+			Deadline: time.Now().Add(5 * time.Second),
+		}
+
+		require.NoError(t, tango.Enqueue(noMatchPlayer))
+
+		sleep()
+
+		_, found := tango.players.Load(noMatchPlayer.IP)
+		assert.True(t, found, "player should still be in queue as no matches are available")
+	})
+
+	t.Run("Remove Host and Cleanup", func(t *testing.T) {
+		t.Parallel()
+
+		logger := noopLogger()
+		tango := New(logger, 10)
+
+		require.NoError(t, tango.Enqueue(hosts[0]))
+		require.NoError(t, tango.Enqueue(hosts[1]))
+
+		sleep()
+
+		require.NoError(t, tango.RemovePlayer(hosts[0].IP))
+
+		sleep()
+
+		_, found := tango.matches.Load(hosts[0].IP)
+		assert.False(t, found, "match should not be found after host removal")
+
+		// Check other host's match still exists
+		match, found := tango.matches.Load(hosts[1].IP)
+		require.True(t, found, "remaining host match should still exist")
+		assert.NotNil(t, match, "match should not be nil")
+	})
+}
+
 func noopLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func sleep() {
+	time.Sleep(time.Second)
 }
