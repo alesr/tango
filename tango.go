@@ -7,17 +7,24 @@ import (
 	"time"
 )
 
+// GameMode defines different game modes for matches.
+// The game mode determines the number of available slots in a match,
+// with the host always occupying one slot.
 type GameMode string
 
 const (
+	// GameMode1v1 represents a 1v1 match type.
 	GameMode1v1 GameMode = "1v1"
+	// GameMode2v2 represents a 2v2 match type.
 	GameMode2v2 GameMode = "2v2"
+	// GameMode3v3 represents a 3v3 match type.
 	GameMode3v3 GameMode = "3v3"
 
 	attemptToJoinMatchFrequency = time.Millisecond * 500
 	checkDeadlinesFrequency     = time.Second
 )
 
+// Match represents a game match with a host, joined players, and game mode details.
 type Match struct {
 	hostPlayerIP   string
 	joinedPlayers  sync.Map
@@ -27,6 +34,7 @@ type Match struct {
 	mu             sync.RWMutex
 }
 
+// Player represents a player attempting to join or host a match, along with game mode preferences.
 type Player struct {
 	IP        string
 	IsHosting bool
@@ -35,6 +43,7 @@ type Player struct {
 	Deadline  time.Time
 }
 
+// Tango is the main structure that manages players, matches, and matchmaking logic.
 type Tango struct {
 	logger      *slog.Logger
 	players     sync.Map
@@ -43,7 +52,8 @@ type Tango struct {
 	mu          sync.Mutex
 }
 
-// New creates a new Tango instance.
+// New creates and initializes a new Tango instance, setting up internal structures and starting background goroutines.
+// `logger` is used for logging information about matchmaking, and `queueSize` defines the size of the player queue.
 func New(logger *slog.Logger, queueSize int) *Tango {
 	t := &Tango{
 		logger:      logger.WithGroup("tango"),
@@ -56,7 +66,7 @@ func New(logger *slog.Logger, queueSize int) *Tango {
 	return t
 }
 
-// Enqueue adds a player to the matchmaking queue.
+// Enqueue adds a player to the matchmaking queue. If the player is already enqueued, an error is returned.
 func (t *Tango) Enqueue(player Player) error {
 	if _, found := t.players.LoadOrStore(player.IP, player); found {
 		return errors.New("player already enqueued")
@@ -65,6 +75,7 @@ func (t *Tango) Enqueue(player Player) error {
 	return nil
 }
 
+// ListMatches returns a list of all active matches managed by Tango.
 func (t *Tango) ListMatches() []*Match {
 	var matches []*Match
 	t.matches.Range(func(_, value any) bool {
@@ -75,7 +86,7 @@ func (t *Tango) ListMatches() []*Match {
 	return matches
 }
 
-// RemovePlayer removes a player from matchmaking.
+// RemovePlayer removes a player from the matchmaking system. If the player is hosting a match, the match is also removed.
 func (t *Tango) RemovePlayer(playerIP string) error {
 	if _, found := t.players.Load(playerIP); !found {
 		return errors.New("player not found")
@@ -94,6 +105,7 @@ func (t *Tango) RemovePlayer(playerIP string) error {
 	return nil
 }
 
+// findMatchForPlayer searches for the match associated with a player, returning it if found along with a boolean indicating if the player is the host.
 func (t *Tango) findMatchForPlayer(playerIP string) (*Match, bool) {
 	var (
 		matchToRemove *Match
@@ -130,10 +142,12 @@ func (t *Tango) findMatchForPlayer(playerIP string) (*Match, bool) {
 	return matchToRemove, isHost
 }
 
+// removePlayer deletes a player from the active matches.
 func (t *Tango) removePlayer(playerIP string) {
 	t.matches.Delete(playerIP)
 }
 
+// removeMatch removes a match by its host's IP, also removing all joined players from the matchmaking system.
 func (t *Tango) removeMatch(hostPlayerIP string) error {
 	if _, found := t.matches.Load(hostPlayerIP); !found {
 		return errors.New("match not found for removal")
@@ -160,6 +174,7 @@ func (t *Tango) removeMatch(hostPlayerIP string) error {
 	return nil
 }
 
+// availableSlotsPerGameMode returns the number of available slots based on the provided game mode.
 func availableSlotsPerGameMode(gm GameMode) int {
 	switch gm {
 	case GameMode1v1:
@@ -171,6 +186,7 @@ func availableSlotsPerGameMode(gm GameMode) int {
 	}
 }
 
+// processQueue handles player requests by either creating new matches or attempting to join existing ones.
 func (t *Tango) processQueue() {
 	for player := range t.playerQueue {
 		if player.IsHosting {
@@ -181,6 +197,7 @@ func (t *Tango) processQueue() {
 	}
 }
 
+// attemptToJoinMatch tries to find an existing match for a player within a specified deadline.
 func (t *Tango) attemptToJoinMatch(player Player) {
 	deadline := time.After(time.Until(player.Deadline))
 
@@ -200,6 +217,7 @@ func (t *Tango) attemptToJoinMatch(player Player) {
 	}
 }
 
+// tryJoinMatch attempts to place a player into an existing match, returning true if successful.
 func (t *Tango) tryJoinMatch(player Player) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -227,10 +245,12 @@ func (t *Tango) tryJoinMatch(player Player) bool {
 	return matchFound
 }
 
+// handlePlayerTimeout removes a player from the system if their deadline expires before joining a match.
 func (t *Tango) handlePlayerTimeout(player Player) {
 	t.RemovePlayer(player.IP)
 }
 
+// checkDeadlines periodically checks for players whose deadlines have expired and removes them from the system.
 func (t *Tango) checkDeadlines() {
 	ticker := time.NewTicker(checkDeadlinesFrequency)
 	defer ticker.Stop()
@@ -248,8 +268,9 @@ func (t *Tango) checkDeadlines() {
 	}
 }
 
+// createMatch creates a new match hosted by the specified player.
 func (t *Tango) createMatch(player Player) {
-	match := &Match{
+	match := Match{
 		hostPlayerIP:   player.IP,
 		joinedPlayers:  sync.Map{},
 		availableSlots: availableSlotsPerGameMode(player.GameMode),
@@ -257,5 +278,5 @@ func (t *Tango) createMatch(player Player) {
 		gameMode:       player.GameMode,
 	}
 
-	t.matches.Store(player.IP, match)
+	t.matches.Store(player.IP, &match)
 }
