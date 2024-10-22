@@ -277,6 +277,14 @@ func TestTangoMultiplePlayers(t *testing.T) {
 		require.True(t, found, "remaining host match should still exist")
 		assert.NotNil(t, match, "match should not be nil")
 	})
+
+	t.Run("Remove Non-Existent Match", func(t *testing.T) {
+		t.Parallel()
+
+		tango := New(noopLogger(), 10)
+		err := tango.removeMatch("foo")
+		assert.Error(t, err, "should return an error if match doesn't exist")
+	})
 }
 
 func noopLogger() *slog.Logger {
