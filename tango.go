@@ -2,8 +2,8 @@ package tango
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,9 +55,8 @@ type Match struct {
 func (m *Match) String() string {
 	var sb strings.Builder
 
-	sb.WriteString("Match Details:\n")
-	sb.WriteString("Host Player IP: " + m.hostPlayerIP + "\n")
-	sb.WriteString("Joined Players: ")
+	sb.WriteString(fmt.Sprintf("Host Player IP: '%s'", m.hostPlayerIP))
+	sb.WriteString(" Joined Players: ")
 
 	var playerCount int
 	m.joinedPlayers.Range(func(_, _ any) bool {
@@ -65,10 +64,10 @@ func (m *Match) String() string {
 		return true
 	})
 
-	sb.WriteString(strconv.Itoa(playerCount) + "\n")
-	sb.WriteString("Available Slots: " + strconv.Itoa(m.availableSlots) + "\n")
-	sb.WriteString("Tags: " + strings.Join(m.tags, ", ") + "\n")
-	sb.WriteString("Game Mode: " + string(m.gameMode) + "\n")
+	sb.WriteString(fmt.Sprintf("'%d'", playerCount))
+	sb.WriteString(fmt.Sprintf(" Available Slots: '%d'", (m.availableSlots)))
+	sb.WriteString(fmt.Sprintf(" Tags: '%s' ", strings.Join(m.tags, ", ")))
+	sb.WriteString(fmt.Sprintf(" Game Mode: '%s'", m.gameMode))
 
 	return sb.String()
 }
