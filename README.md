@@ -105,8 +105,8 @@ A Player contains:
 ## Future Enhancements
 
 	•	Match Filtering: Add advanced filtering options based on tags or player preferences.
-	•	Load Balancing: Distribute players across multiple matches more evenly when there are many hosting players.
+	•	Prioritize matches match completion when distributing players.
 	•	Metrics: Collect statistics on match times, player wait times, and success rates to optimize the system.
 	•	Improve test coverage.
 	•	Memory profilling.
-	•	Use `sync.Pool` is used to manage matches.
+	•	Use `sync.Pool` to manage matches.
