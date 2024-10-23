@@ -27,6 +27,18 @@ const (
 	checkDeadlinesFrequency = time.Second
 )
 
+type TangoError struct {
+	Title string
+}
+
+type PlayerAlreadyEnqueuedError struct{ TangoError }
+
+func (e PlayerAlreadyEnqueuedError) Error() string {
+	return e.Title
+}
+
+var errPlayerAlreadyEnqueued = PlayerAlreadyEnqueuedError{TangoError{"player already enqueued"}}
+
 // Match represents a game match with a host, joined players, and game mode details.
 type Match struct {
 	hostPlayerIP   string
@@ -74,7 +86,7 @@ func New(logger *slog.Logger, queueSize int) *Tango {
 // If the player is already enqueued, an error is returned.
 func (t *Tango) Enqueue(player Player) error {
 	if _, found := t.players.LoadOrStore(player.IP, player); found {
-		return errors.New("player already enqueued")
+		return errPlayerAlreadyEnqueued
 	}
 	t.playerQueue <- player
 	return nil
