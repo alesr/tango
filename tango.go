@@ -3,6 +3,8 @@ package tango
 import (
 	"errors"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,6 +49,28 @@ type Match struct {
 	tags           []string
 	gameMode       GameMode
 	mu             sync.RWMutex
+}
+
+// String returns a string representation of the Match.
+func (m *Match) String() string {
+	var sb strings.Builder
+
+	sb.WriteString("Match Details:\n")
+	sb.WriteString("Host Player IP: " + m.hostPlayerIP + "\n")
+	sb.WriteString("Joined Players: ")
+
+	var playerCount int
+	m.joinedPlayers.Range(func(_, _ any) bool {
+		playerCount++
+		return true
+	})
+
+	sb.WriteString(strconv.Itoa(playerCount) + "\n")
+	sb.WriteString("Available Slots: " + strconv.Itoa(m.availableSlots) + "\n")
+	sb.WriteString("Tags: " + strings.Join(m.tags, ", ") + "\n")
+	sb.WriteString("Game Mode: " + string(m.gameMode) + "\n")
+
+	return sb.String()
 }
 
 // Player represents a player attempting to join or host a match,
