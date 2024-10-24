@@ -2,15 +2,37 @@ package tango
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/singleflight"
 )
+
+// operationType defines the types of operations that can be performed
+type operationType int
+
+const (
+	opEnqueuePlayer operationType = iota + 1
+	opRemovePlayer
+	opListMatches
+	opTimeout
+)
+
+// operation represents a request to modify system state
+type operation struct {
+	op       operationType
+	player   Player
+	playerID string
+	respCh   chan response
+	doneCh   chan struct{}
+}
+
+// response carries the result of an operation
+type response struct {
+	data any
+	err  error
+}
 
 // Tango manages players, matches, and matchmaking.
 type Tango struct {
@@ -21,20 +43,24 @@ type Tango struct {
 	defaultTimeout          time.Duration
 
 	// State management
-	mu      sync.RWMutex
-	players map[string]Player
-	matches map[string]*match
+	state struct {
+		sync.RWMutex
+		players map[string]Player
+		matches map[string]*match
+	}
 
-	// Concurrency control
-	playerOps singleflight.Group // For deduplicating player operations
-	matchPool sync.Pool          // For match reuse
+	// Channel-based coordination
+	opCh      chan operation
+	timeoutCh chan string
+	doneCh    chan struct{}
+
+	// Match pooling
+	matchPool sync.Pool
 
 	// Runtime control
-	playerQueue chan Player
-	done        chan struct{}
-	shutdown    sync.Once
-	wg          sync.WaitGroup
-	started     atomic.Bool
+	shutdown sync.Once
+	wg       sync.WaitGroup
+	started  atomic.Bool
 }
 
 // New creates and initializes a new Tango instance with the provided options.
@@ -44,16 +70,18 @@ func New(opts ...Option) *Tango {
 		attemptToJoinFrequency:  defaultAttemptToJoinFrequency,
 		checkDeadlinesFrequency: defaultCheckDeadlinesFrequency,
 		defaultTimeout:          defaultTimeout,
-		playerQueue:             make(chan Player, defaultPlayerQueueSize),
-		done:                    make(chan struct{}),
-		players:                 make(map[string]Player),
-		matches:                 make(map[string]*match),
-		matchPool: sync.Pool{
-			New: func() any {
-				return &match{
-					joinedPlayers: make(map[string]struct{}),
-				}
-			},
+
+		opCh:      make(chan operation),
+		timeoutCh: make(chan string),
+		doneCh:    make(chan struct{}),
+	}
+
+	t.state.players = make(map[string]Player)
+	t.state.matches = make(map[string]*match)
+
+	t.matchPool = sync.Pool{
+		New: func() any {
+			return newMatch(Player{}, 0)
 		},
 	}
 
@@ -64,21 +92,20 @@ func New(opts ...Option) *Tango {
 }
 
 // Start initializes and starts all background processing.
-// It returns an error if the service is already started.
 func (t *Tango) Start() error {
 	if !t.started.CompareAndSwap(false, true) {
 		return errServiceAlreadyStarted
 	}
 
 	t.wg.Add(2)
-	go t.processQueue()
-	go t.checkTimeouts()
+	go t.processOperations()
+	go t.processTimeouts()
 
 	t.logger.Info("Tango started")
 	return nil
 }
 
-// Shutdown shuts down the Tango service and cleans up resources.
+// Shutdown gracefully shuts down the service.
 func (t *Tango) Shutdown(ctx context.Context) error {
 	if !t.started.Load() {
 		return errServiceNotStarted
@@ -88,163 +115,212 @@ func (t *Tango) Shutdown(ctx context.Context) error {
 
 	t.shutdown.Do(func() {
 		t.started.Store(false)
-		close(t.done)
 
-		cleanupDone := make(chan struct{})
+		// First stop accepting new operations
+		close(t.doneCh)
+
+		// Wait group for cleanup
+		var cleanupWg sync.WaitGroup
+		cleanupWg.Add(1)
+
 		go func() {
-			cleanupCtx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			t.cleanupMatchesAndPlayers(cleanupCtx)
-			close(cleanupDone)
+			defer cleanupWg.Done()
+			t.cleanupMatchesAndPlayers(ctx)
+		}()
+
+		// Wait for cleanup or context cancellation
+		done := make(chan struct{})
+		go func() {
+			cleanupWg.Wait()
+			close(done)
 		}()
 
 		select {
 		case <-ctx.Done():
 			shutdownErr = ctx.Err()
-		case <-cleanupDone:
-			t.wg.Wait()
+		case <-done:
+			t.wg.Wait() // Wait for all goroutines to finish
 		}
 
-		close(t.playerQueue)
-		for range t.playerQueue {
-		}
+		// Now it's safe to close operation channels
+		close(t.opCh)
+		close(t.timeoutCh)
 	})
 	return shutdownErr
 }
 
 // Enqueue adds a player to the matchmaking queue.
-// Context cancellation can be used for removing the player from queue.
 func (t *Tango) Enqueue(ctx context.Context, player Player) error {
 	if !t.started.Load() {
 		return errServiceNotStarted
 	}
 
+	respCh := make(chan response, 1)
+	done := make(chan struct{})
+	defer close(done)
+
 	select {
+	case t.opCh <- operation{
+		op:     opEnqueuePlayer,
+		player: player,
+		respCh: respCh,
+		doneCh: done,
+	}:
+		select {
+		case resp := <-respCh:
+			if resp.err != nil {
+				return resp.err
+			}
+			return nil
+		case <-ctx.Done():
+			// Remove player if context is cancelled
+			t.opCh <- operation{
+				op:       opRemovePlayer,
+				playerID: player.ID,
+				respCh:   make(chan response, 1),
+				doneCh:   done,
+			}
+			return ctx.Err()
+		case <-time.After(t.defaultTimeout):
+			return fmt.Errorf("enqueue operation timed out")
+		}
 	case <-ctx.Done():
 		return ctx.Err()
-	default:
 	}
-
-	_, err, _ := t.playerOps.Do(player.ID, func() (any, error) {
-		t.mu.Lock()
-
-		if _, exists := t.players[player.ID]; exists {
-			t.mu.Unlock()
-			return nil, errPlayerAlreadyEnqueued
-		}
-
-		t.players[player.ID] = player
-
-		t.mu.Unlock()
-
-		select {
-		case t.playerQueue <- player:
-			t.logger.Info("Player enqueued", slog.String("player", player.String()))
-			return nil, nil
-		case <-ctx.Done():
-			t.mu.Lock()
-			delete(t.players, player.ID)
-			t.mu.Unlock()
-			return nil, ctx.Err()
-		}
-	})
-	return err
 }
 
 // ListMatches returns a list of all active matches.
-func (t *Tango) ListMatches() []*match {
-	t.mu.RLock()
-	matches := make([]*match, 0, len(t.matches))
-	for _, match := range t.matches {
-		matches = append(matches, match)
+func (t *Tango) ListMatches() ([]*match, error) {
+	if !t.started.Load() {
+		return nil, errServiceNotStarted
 	}
-	t.mu.RUnlock()
-	return matches
-}
 
-// RemovePlayer removes a player from the matchmaking system.
-func (t *Tango) RemovePlayer(playerID string) error {
-	_, err, _ := t.playerOps.Do(fmt.Sprintf("remove-%s", playerID), func() (any, error) {
-		t.mu.Lock()
-		_, exists := t.players[playerID]
-		if !exists {
-			t.mu.Unlock()
-			return nil, errPlayerNotFound
+	respCh := make(chan response)
+
+	select {
+	case t.opCh <- operation{op: opListMatches, respCh: respCh}:
+		resp := <-respCh
+
+		if matches, ok := resp.data.([]*match); ok {
+			return matches, nil
 		}
-		delete(t.players, playerID)
-		t.mu.Unlock()
-
-		matchToRemove, isHost := t.findMatchForPlayer(playerID)
-		if isHost && matchToRemove != nil {
-			t.removeMatch(matchToRemove.hostPlayerID)
-		} else if matchToRemove != nil {
-			matchToRemove.mu.Lock()
-			delete(matchToRemove.joinedPlayers, playerID)
-			matchToRemove.mu.Unlock()
-		}
-
-		t.logger.Info("Player removed", slog.String("player-id", playerID))
 		return nil, nil
-	})
-
-	return err
+	case <-t.doneCh:
+		return nil, nil
+	}
 }
 
-// tryJoinMatch attempts to place a player into an existing match.
-func (t *Tango) tryJoinMatch(player Player) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	var matchFound bool
-	for _, match := range t.matches {
-		if matchFound = match.tryJoin(player); matchFound {
-			break
-		}
+// RemovePlayer removes a player from the system.
+func (t *Tango) RemovePlayer(playerID string) error {
+	if !t.started.Load() {
+		return errServiceNotStarted
 	}
 
-	if !matchFound {
-		t.logger.Info("No available matches found, retrying...",
-			slog.String("playerID", player.ID),
-			slog.String("gameMode", string(player.GameMode)))
-	}
-	return matchFound
+	respCh := make(chan response)
+	t.opCh <- operation{op: opRemovePlayer, playerID: playerID, respCh: respCh}
+	resp := <-respCh
+	return resp.err
 }
 
-// processQueue handles player requests by either creating
-// new matches or attempting to join existing ones.
-func (t *Tango) processQueue() {
+// processOperations handles all state-modifying operations
+func (t *Tango) processOperations() {
 	defer t.wg.Done()
 
 	for {
 		select {
-		case player, ok := <-t.playerQueue:
-			if !ok {
-				return
+		case op := <-t.opCh:
+			// Check if service is shutting down
+			if !t.started.Load() {
+				op.respCh <- response{err: errServiceNotStarted}
+				continue
 			}
-			if player.IsHosting {
-				t.createMatch(player)
-			} else {
-				t.wg.Add(1)
-				go func(p Player) {
-					defer t.wg.Done()
-					t.attemptToJoinMatch(p)
-				}(player)
+
+			switch op.op {
+			case opEnqueuePlayer:
+				t.handleEnqueue(op)
+			case opRemovePlayer:
+				t.handleRemove(op)
+			case opListMatches:
+				t.handleList(op)
 			}
-		case <-t.done:
+		case <-t.doneCh:
 			return
 		}
 	}
 }
 
-// checkTimeouts periodically checks for players whose timeouts
-// have expired and removes them from the system.
-func (t *Tango) checkTimeouts() {
+// handleEnqueue adds a player to the system and initiates the matchmaking process.
+func (t *Tango) handleEnqueue(op operation) {
+	t.state.Lock()
+	if _, exists := t.state.players[op.player.ID]; exists {
+		t.state.Unlock()
+		op.respCh <- response{err: errPlayerAlreadyEnqueued}
+		return
+	}
+
+	// Store player first
+	t.state.players[op.player.ID] = op.player
+	t.state.Unlock()
+
+	if op.player.IsHosting {
+		match := t.createMatch(op.player)
+		t.state.Lock()
+		t.state.matches[op.player.ID] = match
+		t.state.Unlock()
+	} else {
+		go t.attemptToJoinMatch(op.player)
+	}
+
+	t.logger.Info("Player enqueued", slog.String("player", op.player.String()))
+	op.respCh <- response{}
+}
+
+// handleRemove removes a player from the system and cleans up any associated matches.
+func (t *Tango) handleRemove(op operation) {
+	t.state.Lock()
+	_, exists := t.state.players[op.playerID]
+	if !exists {
+		t.state.Unlock()
+		op.respCh <- response{err: errPlayerNotFound}
+		return
+	}
+
+	delete(t.state.players, op.playerID)
+	t.state.Unlock()
+
+	// Handle match cleanup if needed
+	match, isHost := t.findMatchForPlayer(op.playerID)
+	if match != nil {
+		if isHost {
+			t.removeMatch(match.hostPlayerID)
+		} else {
+			match.removePlayer(op.playerID)
+		}
+	}
+
+	t.logger.Info("Player removed", slog.String("player-id", op.playerID))
+	op.respCh <- response{}
+}
+
+// handleList returns a list of all active matches.
+func (t *Tango) handleList(op operation) {
+	t.state.RLock()
+	matches := make([]*match, 0, len(t.state.matches))
+	for _, m := range t.state.matches {
+		matches = append(matches, m)
+	}
+	t.state.RUnlock()
+	op.respCh <- response{data: matches}
+}
+
+// processTimeouts handles player timeout checks and removes expired players.
+func (t *Tango) processTimeouts() {
 	defer t.wg.Done()
 
 	ticker := time.NewTicker(t.checkDeadlinesFrequency)
 	defer ticker.Stop()
 
-	// Pre-allocate slice for expired players
+	// TODO(alesr): pass channel size via config.
 	expired := make([]string, 0, 32)
 
 	for {
@@ -252,177 +328,164 @@ func (t *Tango) checkTimeouts() {
 		case <-ticker.C:
 			now := time.Now().Unix()
 
-			t.mu.RLock()
-			for id, player := range t.players {
+			t.state.RLock()
+			for id, player := range t.state.players {
 				if now > player.timeout {
 					expired = append(expired, id)
 				}
 			}
-			t.mu.RUnlock()
+			t.state.RUnlock()
 
-			// Batch remove expired players
-			if len(expired) > 0 {
-				for _, id := range expired {
-					t.RemovePlayer(id)
-				}
-				expired = expired[:0]
+			for _, id := range expired {
+				t.RemovePlayer(id)
 			}
-		case <-t.done:
+			expired = expired[:0]
+
+		case <-t.doneCh:
 			return
 		}
 	}
 }
 
-// attemptToJoinMatch tries to find an existing match
-// for a player within their deadline.
+// attemptToJoinMatch tries to find a match for a player and adds them if a suitable match is found.
 func (t *Tango) attemptToJoinMatch(player Player) {
 	ticker := time.NewTicker(t.attemptToJoinFrequency)
 	defer ticker.Stop()
 
-	timeoutChan := time.After(
-		time.Until(time.Unix(player.timeout, 0)),
-	)
+	timeoutCh := time.After(time.Until(time.Unix(player.timeout, 0)))
 
 	for {
 		select {
-		case <-timeoutChan:
-			t.RemovePlayer(player.ID)
+		case <-timeoutCh:
+			_ = t.RemovePlayer(player.ID)
 			return
 		case <-ticker.C:
-			if t.tryJoinMatch(player) {
+			if !t.started.Load() {
 				return
 			}
-		case <-t.done:
+
+			if match := t.findSuitableMatch(player); match != nil {
+				respCh := make(chan matchResponse)
+
+				select {
+				case match.requestCh <- matchRequest{
+					op:     matchJoin,
+					player: player,
+					respCh: respCh,
+				}:
+					select {
+					case resp := <-respCh:
+						if resp.success {
+							return
+						}
+					case <-t.doneCh:
+						return
+					}
+				case <-t.doneCh:
+					return
+				}
+			}
+		case <-t.doneCh:
 			return
 		}
 	}
 }
 
-// handlePlayerTimeout removes a player from the system
-// when their deadline expires.
-func (t *Tango) handlePlayerTimeout(player Player) {
-	t.RemovePlayer(player.ID)
-}
+// findSuitableMatch searches for a match that has the same game mode and available slots for the given player.
+func (t *Tango) findSuitableMatch(player Player) *match {
+	t.state.RLock()
+	defer t.state.RUnlock()
 
-// findMatchForPlayer searches for the match associated with a player.
-func (t *Tango) findMatchForPlayer(playerID string) (*match, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	for _, match := range t.matches {
-		match.mu.RLock()
-		isHost := match.hostPlayerID == playerID
-		_, isJoined := match.joinedPlayers[playerID]
-		match.mu.RUnlock()
-
-		if isHost || isJoined {
-			return match, isHost
+	// Check all matches in a deterministic order
+	for _, m := range t.state.matches {
+		// Verify game mode and available slots before attempting to join
+		m.mu.RLock()
+		if m.gameMode == player.GameMode && m.availableSlots > 0 {
+			m.mu.RUnlock()
+			return m
 		}
+		m.mu.RUnlock()
 	}
-	return nil, false
+	return nil
 }
 
-// createMatch creates a new match from the pool.
-func (t *Tango) createMatch(player Player) {
+// createMatch creates a new match with the given host player and starts the match goroutine.
+func (t *Tango) createMatch(player Player) *match {
 	match := t.matchPool.Get().(*match)
 
+	// Initialize match before starting goroutine
 	match.mu.Lock()
 	match.hostPlayerID = player.ID
 	match.availableSlots = uint8(availableSlotsPerGameMode(player.GameMode))
 	match.gameMode = player.GameMode
 	match.tagCount = player.tagCount
-	for i := uint8(0); i < player.tagCount; i++ {
-		match.tags[i] = player.tags[i]
-	}
+	copy(match.tags[:], player.tags[:player.tagCount])
+	match.joinedPlayers = sync.Map{}
+	match.requestCh = make(chan matchRequest)
+	match.doneCh = make(chan struct{})
+	match.closed.Store(false)
 	match.mu.Unlock()
 
-	t.mu.Lock()
-	t.matches[player.ID] = match
-	t.mu.Unlock()
+	// Start match goroutine after full initialization
+	go match.run()
+
+	return match
 }
 
-// removeMatch removes a match and returns it to the pool.
+// removeMatch removes a match from the system and returns it to the match pool.
 func (t *Tango) removeMatch(hostPlayerID string) error {
-	t.mu.Lock()
-	match, exists := t.matches[hostPlayerID]
+	t.state.Lock()
+	match, exists := t.state.matches[hostPlayerID]
 	if !exists {
-		t.mu.Unlock()
-		return errors.New("match not found for removal")
+		t.state.Unlock()
+		return fmt.Errorf("match not found")
 	}
-	delete(t.matches, hostPlayerID)
-	t.mu.Unlock()
+	delete(t.state.matches, hostPlayerID)
+	t.state.Unlock()
 
-	// Cleanup and return to pool after removing from map
-	match.mu.Lock()
-	// Clear the joined players map
-	for playerID := range match.joinedPlayers {
-		delete(match.joinedPlayers, playerID)
-	}
-
-	// Reset match fields
-	match.hostPlayerID = ""
-	match.availableSlots = 0
-	match.tagCount = 0
-	match.gameMode = ""
-
-	// Clear tags array
-	for i := range match.tags {
-		match.tags[i] = ""
-	}
-	match.mu.Unlock()
-
-	// Return to pool
+	match.cleanup()
 	t.matchPool.Put(match)
-
 	return nil
 }
 
-// cleanupMatchesAndPlayers cleans up existing matches and players.
-func (t *Tango) cleanupMatchesAndPlayers(ctx context.Context) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// findMatchForPlayer finds the match that a player is either hosting or joined.
+func (t *Tango) findMatchForPlayer(playerID string) (*match, bool) {
+	t.state.RLock()
+	defer t.state.RUnlock()
 
-	for hostID, match := range t.matches {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			t.cleanupAndReturnMatch(match)
-			delete(t.matches, hostID)
+	for _, m := range t.state.matches {
+		if m.hostPlayerID == playerID {
+			return m, true
+		}
+		if m.hasPlayer(playerID) {
+			return m, false
 		}
 	}
-
-	for playerID := range t.players {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			delete(t.players, playerID)
-		}
-	}
+	return nil, false
 }
 
-// cleanupAndReturnMatch prepares a match for return to the pool.
-func (t *Tango) cleanupAndReturnMatch(match *match) {
-	match.mu.Lock()
-	defer match.mu.Unlock()
+// cleanupMatchesAndPlayers removes all matches and players from the system during shutdown.
+func (t *Tango) cleanupMatchesAndPlayers(ctx context.Context) {
+	t.state.Lock()
+	defer t.state.Unlock()
 
-	// Clear the joined players map
-	for playerID := range match.joinedPlayers {
-		delete(match.joinedPlayers, playerID)
+	for hostID, match := range t.state.matches {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			match.cleanup()
+			t.matchPool.Put(match)
+			delete(t.state.matches, hostID)
+		}
 	}
 
-	// Reset match fields
-	match.hostPlayerID = ""
-	match.availableSlots = 0
-	match.tagCount = 0
-	match.gameMode = ""
-
-	// Clear tags array
-	for i := range match.tags {
-		match.tags[i] = ""
+	for playerID := range t.state.players {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			delete(t.state.players, playerID)
+		}
 	}
-
-	// Return to pool
-	t.matchPool.Put(match)
 }
