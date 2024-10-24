@@ -1,331 +1,428 @@
 package tango
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
-// GameMode defines different game modes for matches.
-// The game mode determines the number of available slots in a match,
-// with the host always occupying one slot.
-type GameMode string
-
-const (
-	// GameMode1v1 represents a 1v1 match type.
-	GameMode1v1 GameMode = "1v1"
-	// GameMode2v2 represents a 2v2 match type.
-	GameMode2v2 GameMode = "2v2"
-	// GameMode3v3 represents a 3v3 match type.
-	GameMode3v3 GameMode = "3v3"
-
-	// Frequency which Tango tries to find a match for a player.
-	attemptToJoinMatchFrequency = time.Millisecond * 500
-
-	// Frequency which Tango looks for players with matching deadline reached.
-	checkDeadlinesFrequency = time.Second
-)
-
-type TangoError struct {
-	Title string
-}
-
-type PlayerAlreadyEnqueuedError struct{ TangoError }
-
-func (e PlayerAlreadyEnqueuedError) Error() string {
-	return e.Title
-}
-
-var errPlayerAlreadyEnqueued = PlayerAlreadyEnqueuedError{TangoError{"player already enqueued"}}
-
-// Match represents a game match with a host, joined players, and game mode details.
-type Match struct {
-	hostPlayerIP   string
-	joinedPlayers  sync.Map
-	availableSlots int
-	tags           []string
-	gameMode       GameMode
-	mu             sync.RWMutex
-}
-
-// String returns a string representation of the Match.
-func (m *Match) String() string {
-	var sb strings.Builder
-
-	sb.WriteString(fmt.Sprintf("Host Player IP: '%s'", m.hostPlayerIP))
-	sb.WriteString(" Joined Players: ")
-
-	var playerCount int
-	m.joinedPlayers.Range(func(_, _ any) bool {
-		playerCount++
-		return true
-	})
-
-	sb.WriteString(fmt.Sprintf("'%d'", playerCount))
-	sb.WriteString(fmt.Sprintf(" Available Slots: '%d'", (m.availableSlots)))
-	sb.WriteString(fmt.Sprintf(" Tags: '%s' ", strings.Join(m.tags, ", ")))
-	sb.WriteString(fmt.Sprintf(" Game Mode: '%s'", m.gameMode))
-
-	return sb.String()
-}
-
-// Player represents a player attempting to join or host a match,
-// along with game mode preferences.
-type Player struct {
-	IP        string
-	IsHosting bool
-	Tags      []string
-	GameMode  GameMode
-	Deadline  time.Time
-}
-
-// Tango is the main structure that manages players,
-// matches, and matchmaking logic.
+// Tango manages players, matches, and matchmaking.
 type Tango struct {
-	logger      *slog.Logger
-	players     sync.Map
-	matches     sync.Map
+	// Configuration
+	logger                  *slog.Logger
+	attemptToJoinFrequency  time.Duration
+	checkDeadlinesFrequency time.Duration
+	defaultTimeout          time.Duration
+
+	// State management
+	mu      sync.RWMutex
+	players map[string]Player
+	matches map[string]*match
+
+	// Concurrency control
+	playerOps singleflight.Group // For deduplicating player operations
+	matchPool sync.Pool          // For match reuse
+
+	// Runtime control
 	playerQueue chan Player
-	mu          sync.Mutex
+	done        chan struct{}
+	shutdown    sync.Once
+	wg          sync.WaitGroup
+	started     atomic.Bool
 }
 
-// New creates and initializes a new Tango instance.
-func New(logger *slog.Logger, queueSize int) *Tango {
-	t := &Tango{
-		logger:      logger.WithGroup("tango"),
-		playerQueue: make(chan Player, queueSize),
+// New creates and initializes a new Tango instance with the provided options.
+func New(opts ...Option) *Tango {
+	t := Tango{
+		logger:                  slog.Default().WithGroup("tango"),
+		attemptToJoinFrequency:  defaultAttemptToJoinFrequency,
+		checkDeadlinesFrequency: defaultCheckDeadlinesFrequency,
+		defaultTimeout:          defaultTimeout,
+		playerQueue:             make(chan Player, defaultPlayerQueueSize),
+		done:                    make(chan struct{}),
+		players:                 make(map[string]Player),
+		matches:                 make(map[string]*match),
+		matchPool: sync.Pool{
+			New: func() any {
+				return &match{
+					joinedPlayers: make(map[string]struct{}),
+				}
+			},
+		},
 	}
 
+	for _, opt := range opts {
+		opt(&t)
+	}
+	return &t
+}
+
+// Start initializes and starts all background processing.
+// It returns an error if the service is already started.
+func (t *Tango) Start() error {
+	if !t.started.CompareAndSwap(false, true) {
+		return errServiceAlreadyStarted
+	}
+
+	t.wg.Add(2)
 	go t.processQueue()
-	go t.checkDeadlines()
+	go t.checkTimeouts()
 
-	return t
-}
-
-// Enqueue adds a player to the matchmaking queue.
-// If the player is already enqueued, an error is returned.
-func (t *Tango) Enqueue(player Player) error {
-	if _, found := t.players.LoadOrStore(player.IP, player); found {
-		return errPlayerAlreadyEnqueued
-	}
-	t.playerQueue <- player
+	t.logger.Info("Tango started")
 	return nil
 }
 
-// ListMatches returns a list of all active matches managed by Tango.
-func (t *Tango) ListMatches() []*Match {
-	var matches []*Match
-	t.matches.Range(func(_, value any) bool {
-		match := value.(*Match)
-		matches = append(matches, match)
-		return true
+// Shutdown shuts down the Tango service and cleans up resources.
+func (t *Tango) Shutdown(ctx context.Context) error {
+	if !t.started.Load() {
+		return errServiceNotStarted
+	}
+
+	var shutdownErr error
+
+	t.shutdown.Do(func() {
+		t.started.Store(false)
+		close(t.done)
+
+		cleanupDone := make(chan struct{})
+		go func() {
+			cleanupCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			t.cleanupMatchesAndPlayers(cleanupCtx)
+			close(cleanupDone)
+		}()
+
+		select {
+		case <-ctx.Done():
+			shutdownErr = ctx.Err()
+		case <-cleanupDone:
+			t.wg.Wait()
+		}
+
+		close(t.playerQueue)
+		for range t.playerQueue {
+		}
 	})
+	return shutdownErr
+}
+
+// Enqueue adds a player to the matchmaking queue.
+// Context cancellation can be used for removing the player from queue.
+func (t *Tango) Enqueue(ctx context.Context, player Player) error {
+	if !t.started.Load() {
+		return errServiceNotStarted
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	_, err, _ := t.playerOps.Do(player.ID, func() (any, error) {
+		t.mu.Lock()
+
+		if _, exists := t.players[player.ID]; exists {
+			t.mu.Unlock()
+			return nil, errPlayerAlreadyEnqueued
+		}
+
+		t.players[player.ID] = player
+
+		t.mu.Unlock()
+
+		select {
+		case t.playerQueue <- player:
+			t.logger.Info("Player enqueued", slog.String("player", player.String()))
+			return nil, nil
+		case <-ctx.Done():
+			t.mu.Lock()
+			delete(t.players, player.ID)
+			t.mu.Unlock()
+			return nil, ctx.Err()
+		}
+	})
+	return err
+}
+
+// ListMatches returns a list of all active matches.
+func (t *Tango) ListMatches() []*match {
+	t.mu.RLock()
+	matches := make([]*match, 0, len(t.matches))
+	for _, match := range t.matches {
+		matches = append(matches, match)
+	}
+	t.mu.RUnlock()
 	return matches
 }
 
 // RemovePlayer removes a player from the matchmaking system.
-// If the player is hosting a match, the match is also removed.
-func (t *Tango) RemovePlayer(playerIP string) error {
-	if _, found := t.players.Load(playerIP); !found {
-		return errors.New("player not found")
-	}
+func (t *Tango) RemovePlayer(playerID string) error {
+	_, err, _ := t.playerOps.Do(fmt.Sprintf("remove-%s", playerID), func() (any, error) {
+		t.mu.Lock()
+		_, exists := t.players[playerID]
+		if !exists {
+			t.mu.Unlock()
+			return nil, errPlayerNotFound
+		}
+		delete(t.players, playerID)
+		t.mu.Unlock()
 
-	t.players.Delete(playerIP)
-
-	matchToRemove, isHost := t.findMatchForPlayer(playerIP)
-
-	if isHost && matchToRemove != nil {
-		t.removeMatch(matchToRemove.hostPlayerIP)
-	} else if matchToRemove != nil {
-		t.removePlayer(playerIP)
-	}
-
-	return nil
-}
-
-// findMatchForPlayer searches for the match associated with a player,
-// returning it if found along with a boolean indicating if the player is the host.
-func (t *Tango) findMatchForPlayer(playerIP string) (*Match, bool) {
-	var (
-		matchToRemove *Match
-		isHost        bool
-	)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.matches.Range(func(_, value any) bool {
-		match := value.(*Match)
-
-		if match.hostPlayerIP == playerIP {
-			isHost = true
-			matchToRemove = match
-			return false
+		matchToRemove, isHost := t.findMatchForPlayer(playerID)
+		if isHost && matchToRemove != nil {
+			t.removeMatch(matchToRemove.hostPlayerID)
+		} else if matchToRemove != nil {
+			matchToRemove.mu.Lock()
+			delete(matchToRemove.joinedPlayers, playerID)
+			matchToRemove.mu.Unlock()
 		}
 
-		match.mu.Lock()
-		defer match.mu.Unlock()
+		t.logger.Info("Player removed", slog.String("player-id", playerID))
+		return nil, nil
+	})
 
-		if _, ok := match.joinedPlayers.Load(playerIP); ok {
-			match.joinedPlayers.Delete(playerIP)
-			match.availableSlots++
+	return err
+}
 
-			if match.availableSlots == availableSlotsPerGameMode(match.gameMode) {
-				matchToRemove = match
-				return false
-			}
+// tryJoinMatch attempts to place a player into an existing match.
+func (t *Tango) tryJoinMatch(player Player) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var matchFound bool
+	for _, match := range t.matches {
+		if matchFound = match.tryJoin(player); matchFound {
+			break
 		}
-		return true
-	})
-
-	return matchToRemove, isHost
-}
-
-// removePlayer deletes a player from the active matches.
-func (t *Tango) removePlayer(playerIP string) {
-	t.matches.Delete(playerIP)
-}
-
-// removeMatch removes a match by its host's IP,
-// also removing all joined players from the matchmaking system.
-func (t *Tango) removeMatch(hostPlayerIP string) error {
-	if _, found := t.matches.Load(hostPlayerIP); !found {
-		return errors.New("match not found for removal")
 	}
 
-	// Get the match and remove all joined players
-	match, _ := t.matches.Load(hostPlayerIP)
-	matchInstance := match.(*Match)
-
-	// Lock before accessing joinedPlayers
-	matchInstance.mu.Lock()
-	defer matchInstance.mu.Unlock()
-
-	// Remove each player from the players map
-	matchInstance.joinedPlayers.Range(func(key, _ any) bool {
-		playerIP := key.(string)
-		t.players.Delete(playerIP)
-		return true
-	})
-
-	t.matches.Delete(hostPlayerIP)
-	t.players.Delete(hostPlayerIP)
-
-	return nil
-}
-
-// availableSlotsPerGameMode returns the number of available
-// slots based on the provided game mode.
-func availableSlotsPerGameMode(gm GameMode) int {
-	switch gm {
-	case GameMode1v1:
-		return 1
-	case GameMode2v2:
-		return 3
-	default:
-		return 5
+	if !matchFound {
+		t.logger.Info("No available matches found, retrying...",
+			slog.String("playerID", player.ID),
+			slog.String("gameMode", string(player.GameMode)))
 	}
+	return matchFound
 }
 
 // processQueue handles player requests by either creating
 // new matches or attempting to join existing ones.
 func (t *Tango) processQueue() {
-	for player := range t.playerQueue {
-		if player.IsHosting {
-			t.createMatch(player)
-		} else {
-			go t.attemptToJoinMatch(player)
+	defer t.wg.Done()
+
+	for {
+		select {
+		case player, ok := <-t.playerQueue:
+			if !ok {
+				return
+			}
+			if player.IsHosting {
+				t.createMatch(player)
+			} else {
+				t.wg.Add(1)
+				go func(p Player) {
+					defer t.wg.Done()
+					t.attemptToJoinMatch(p)
+				}(player)
+			}
+		case <-t.done:
+			return
+		}
+	}
+}
+
+// checkTimeouts periodically checks for players whose timeouts
+// have expired and removes them from the system.
+func (t *Tango) checkTimeouts() {
+	defer t.wg.Done()
+
+	ticker := time.NewTicker(t.checkDeadlinesFrequency)
+	defer ticker.Stop()
+
+	// Pre-allocate slice for expired players
+	expired := make([]string, 0, 32)
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now().Unix()
+
+			t.mu.RLock()
+			for id, player := range t.players {
+				if now > player.timeout {
+					expired = append(expired, id)
+				}
+			}
+			t.mu.RUnlock()
+
+			// Batch remove expired players
+			if len(expired) > 0 {
+				for _, id := range expired {
+					t.RemovePlayer(id)
+				}
+				expired = expired[:0]
+			}
+		case <-t.done:
+			return
 		}
 	}
 }
 
 // attemptToJoinMatch tries to find an existing match
-// for a player within a specified deadline.
+// for a player within their deadline.
 func (t *Tango) attemptToJoinMatch(player Player) {
-	deadline := time.After(time.Until(player.Deadline))
-
-	ticker := time.NewTicker(attemptToJoinMatchFrequency)
+	ticker := time.NewTicker(t.attemptToJoinFrequency)
 	defer ticker.Stop()
+
+	timeoutChan := time.After(
+		time.Until(time.Unix(player.timeout, 0)),
+	)
 
 	for {
 		select {
-		case <-deadline:
-			t.handlePlayerTimeout(player)
+		case <-timeoutChan:
+			t.RemovePlayer(player.ID)
 			return
 		case <-ticker.C:
 			if t.tryJoinMatch(player) {
 				return
 			}
+		case <-t.done:
+			return
 		}
 	}
-}
-
-// tryJoinMatch attempts to place a player into an existing match,
-// returning true if successful.
-func (t *Tango) tryJoinMatch(player Player) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	var matchFound bool
-
-	t.matches.Range(func(_, value any) bool {
-		match := value.(*Match)
-
-		match.mu.Lock()
-		defer match.mu.Unlock()
-
-		if match.gameMode == player.GameMode && match.availableSlots > 0 {
-			match.joinedPlayers.Store(player.IP, player)
-			match.availableSlots--
-			matchFound = true
-			return false
-		}
-		return true
-	})
-
-	if !matchFound {
-		t.logger.Info("No available matches found, retrying...", slog.String("playerIP", player.IP))
-	}
-	return matchFound
 }
 
 // handlePlayerTimeout removes a player from the system
-// if their deadline expires before joining a match.
+// when their deadline expires.
 func (t *Tango) handlePlayerTimeout(player Player) {
-	t.RemovePlayer(player.IP)
+	t.RemovePlayer(player.ID)
 }
 
-// checkDeadlines periodically checks for players whose deadlines
-//
-//	have expired and removes them from the system.
-func (t *Tango) checkDeadlines() {
-	ticker := time.NewTicker(checkDeadlinesFrequency)
-	defer ticker.Stop()
+// findMatchForPlayer searches for the match associated with a player.
+func (t *Tango) findMatchForPlayer(playerID string) (*match, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
-	for range ticker.C {
-		now := time.Now()
-		t.players.Range(func(_, value any) bool {
-			player := value.(Player)
+	for _, match := range t.matches {
+		match.mu.RLock()
+		isHost := match.hostPlayerID == playerID
+		_, isJoined := match.joinedPlayers[playerID]
+		match.mu.RUnlock()
 
-			if now.After(player.Deadline) {
-				t.RemovePlayer(player.IP)
-			}
-			return true
-		})
+		if isHost || isJoined {
+			return match, isHost
+		}
 	}
+	return nil, false
 }
 
-// createMatch creates a new match hosted by the specified player.
+// createMatch creates a new match from the pool.
 func (t *Tango) createMatch(player Player) {
-	match := Match{
-		hostPlayerIP:   player.IP,
-		joinedPlayers:  sync.Map{},
-		availableSlots: availableSlotsPerGameMode(player.GameMode),
-		tags:           player.Tags,
-		gameMode:       player.GameMode,
+	match := t.matchPool.Get().(*match)
+
+	match.mu.Lock()
+	match.hostPlayerID = player.ID
+	match.availableSlots = uint8(availableSlotsPerGameMode(player.GameMode))
+	match.gameMode = player.GameMode
+	match.tagCount = player.tagCount
+	for i := uint8(0); i < player.tagCount; i++ {
+		match.tags[i] = player.tags[i]
 	}
-	t.matches.Store(player.IP, &match)
+	match.mu.Unlock()
+
+	t.mu.Lock()
+	t.matches[player.ID] = match
+	t.mu.Unlock()
+}
+
+// removeMatch removes a match and returns it to the pool.
+func (t *Tango) removeMatch(hostPlayerID string) error {
+	t.mu.Lock()
+	match, exists := t.matches[hostPlayerID]
+	if !exists {
+		t.mu.Unlock()
+		return errors.New("match not found for removal")
+	}
+	delete(t.matches, hostPlayerID)
+	t.mu.Unlock()
+
+	// Cleanup and return to pool after removing from map
+	match.mu.Lock()
+	// Clear the joined players map
+	for playerID := range match.joinedPlayers {
+		delete(match.joinedPlayers, playerID)
+	}
+
+	// Reset match fields
+	match.hostPlayerID = ""
+	match.availableSlots = 0
+	match.tagCount = 0
+	match.gameMode = ""
+
+	// Clear tags array
+	for i := range match.tags {
+		match.tags[i] = ""
+	}
+	match.mu.Unlock()
+
+	// Return to pool
+	t.matchPool.Put(match)
+
+	return nil
+}
+
+// cleanupMatchesAndPlayers cleans up existing matches and players.
+func (t *Tango) cleanupMatchesAndPlayers(ctx context.Context) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for hostID, match := range t.matches {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			t.cleanupAndReturnMatch(match)
+			delete(t.matches, hostID)
+		}
+	}
+
+	for playerID := range t.players {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			delete(t.players, playerID)
+		}
+	}
+}
+
+// cleanupAndReturnMatch prepares a match for return to the pool.
+func (t *Tango) cleanupAndReturnMatch(match *match) {
+	match.mu.Lock()
+	defer match.mu.Unlock()
+
+	// Clear the joined players map
+	for playerID := range match.joinedPlayers {
+		delete(match.joinedPlayers, playerID)
+	}
+
+	// Reset match fields
+	match.hostPlayerID = ""
+	match.availableSlots = 0
+	match.tagCount = 0
+	match.gameMode = ""
+
+	// Clear tags array
+	for i := range match.tags {
+		match.tags[i] = ""
+	}
+
+	// Return to pool
+	t.matchPool.Put(match)
 }
