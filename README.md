@@ -1,7 +1,7 @@
 # Tango
 [![codecov](https://codecov.io/gh/alesr/tango/branch/main/graph/badge.svg)](https://codecov.io/gh/alesr/tango)
 
-An experimental matchmaking service written in Go that I built for fun. It handles player queues and match creation with a focus on concurrent operations.
+Tango is experimental matchmaking service written in Go that I built for fun. It handles player queues and match creation with a focus on concurrent operations.
 
 ## ⚠️ Heads Up
 
