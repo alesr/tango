@@ -84,7 +84,7 @@ func BenchmarkMatchmaking(b *testing.B) {
 
 		// Wait for the matchmaking to complete
 		select {
-		case <-tango.done:
+		case <-tango.doneCh:
 		case <-time.After(time.Second * 10):
 			cancel()
 		}
