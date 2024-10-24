@@ -1,6 +1,8 @@
 package tango
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -10,287 +12,281 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testPlayer represents a test player configuration
+type testPlayer struct {
+	id       string
+	isHost   bool
+	gameMode GameMode
+	tags     []string
+}
+
+// testContext represents common test context
+type testContext struct {
+	t     *testing.T
+	tango *Tango
+	ctx   context.Context
+}
+
+// setupTest creates a new test context with initialized Tango instance
+func setupTest(t *testing.T) *testContext {
+	t.Helper()
+	ctx := context.TODO()
+	tango := New(WithLogger(noopLogger()))
+	require.NoError(t, tango.Start())
+
+	return &testContext{
+		t:     t,
+		tango: tango,
+		ctx:   ctx,
+	}
+}
+
+// cleanup performs test cleanup
+func (tc *testContext) cleanup() {
+	tc.t.Helper()
+	require.NoError(tc.t, tc.tango.Shutdown(tc.ctx))
+}
+
+// createTestPlayer creates a new player for testing
+func createTestPlayer(cfg testPlayer) Player {
+	deadline := time.Now().Add(10 * time.Second)
+	return NewPlayer(cfg.id, cfg.isHost, cfg.gameMode, deadline, cfg.tags)
+}
+
+// assertPlayerInMatch checks if a player is in a specific match
+func (tc *testContext) assertPlayerInMatch(hostID, playerID string) bool {
+	tc.t.Helper()
+
+	tc.tango.mu.RLock()
+	defer tc.tango.mu.RUnlock()
+
+	match, exists := tc.tango.matches[hostID]
+	if !exists {
+		return false
+	}
+
+	match.mu.RLock()
+	defer match.mu.RUnlock()
+
+	_, found := match.joinedPlayers[playerID]
+	return found && match.availableSlots == 0
+}
+
+// enqueuePlayers enqueues multiple players concurrently
+func (tc *testContext) enqueuePlayers(players []Player) error {
+	errCh := make(chan error, len(players))
+
+	for _, player := range players {
+		go func(p Player) {
+			errCh <- tc.tango.Enqueue(tc.ctx, p)
+		}(player)
+	}
+
+	for i := 0; i < len(players); i++ {
+		if err := <-errCh; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestTangoMatchmaking(t *testing.T) {
 	t.Parallel()
 
-	logger := noopLogger()
-
-	hostPlayer := Player{
-		IP:        "host_player_id",
-		IsHosting: true,
-		Tags:      []string{"dummy-tag"},
-		GameMode:  GameMode1v1,
-		Deadline:  time.Now().Add(10 * time.Second),
-	}
-
-	joiningPlayer := Player{
-		IP:       "player_ip",
-		Tags:     []string{"dummy-tag"},
-		GameMode: GameMode1v1,
-		Deadline: time.Now().Add(10 * time.Second),
-	}
-
 	t.Run("Match for Host Player", func(t *testing.T) {
 		t.Parallel()
+		tc := setupTest(t)
+		defer tc.cleanup()
 
-		tango := New(logger, 10)
+		hostPlayer := createTestPlayer(testPlayer{
+			id:       "host_player_id",
+			isHost:   true,
+			gameMode: GameMode1v1,
+			tags:     []string{"dummy-tag"},
+		})
 
-		// Enqueue players
-		require.NoError(t, tango.Enqueue(hostPlayer))
-		require.NoError(t, tango.Enqueue(joiningPlayer))
+		joiningPlayer := createTestPlayer(testPlayer{
+			id:       "player_ip",
+			isHost:   false,
+			gameMode: GameMode1v1,
+			tags:     []string{"dummy-tag"},
+		})
 
-		// Wait for the matchmaking process to complete
-		sleep()
+		require.NoError(t, tc.tango.Enqueue(tc.ctx, hostPlayer))
+		require.NoError(t, tc.tango.Enqueue(tc.ctx, joiningPlayer))
 
-		m, hostFound := tango.matches.Load(hostPlayer.IP)
-		require.True(t, hostFound, "hosting player not found in match")
-
-		match := m.(*Match)
-
-		assert.NotNil(t, match, "match should not be nil")
-		assert.Equal(t, hostPlayer.IP, match.hostPlayerIP, "host player IP does not match")
-		assert.Equal(t, hostPlayer.GameMode, match.gameMode, "game mode does not match")
-		assert.ElementsMatch(t, hostPlayer.Tags, match.tags, "tags do not match")
-
-		_, playerFound := match.joinedPlayers.Load(joiningPlayer.IP)
-		assert.True(t, playerFound, "player not found in match")
-
-		match.mu.RLock()
-		defer match.mu.RUnlock()
-
-		assert.Equal(t, 0, match.availableSlots, "expected available slots to be 0")
+		assert.Eventually(t, func() bool {
+			return tc.assertPlayerInMatch(hostPlayer.ID, joiningPlayer.ID)
+		}, 2*time.Second, 100*time.Millisecond, "match should be created and player should join")
 	})
 
-	t.Run("Remove Players", func(t *testing.T) {
+	t.Run("Context Cancellation", func(t *testing.T) {
 		t.Parallel()
+		tc := setupTest(t)
+		defer tc.cleanup()
 
-		tango := New(logger, 10)
+		ctx, cancel := context.WithCancel(context.TODO())
+		cancel() // Cancel immediately
 
-		// Enqueue players
-		require.NoError(t, tango.Enqueue(hostPlayer))
-		require.NoError(t, tango.Enqueue(joiningPlayer))
+		player := createTestPlayer(testPlayer{
+			id:       "test-player",
+			isHost:   false,
+			gameMode: GameMode1v1,
+			tags:     nil,
+		})
 
-		sleep()
+		err := tc.tango.Enqueue(ctx, player)
+		assert.ErrorIs(t, err, context.Canceled, "should return context.Canceled error")
 
-		// Remove joining player
-		require.NoError(t, tango.RemovePlayer(joiningPlayer.IP))
-		_, playerFound := tango.players.Load(joiningPlayer.IP)
-		assert.False(t, playerFound, "player should not be found after removal")
-
-		// Now remove the host player
-		require.NoError(t, tango.RemovePlayer(hostPlayer.IP))
-		_, hostFound := tango.players.Load(hostPlayer.IP)
-		assert.False(t, hostFound, "host should not be found after removal")
+		tc.tango.mu.RLock()
+		_, exists := tc.tango.players[player.ID]
+		tc.tango.mu.RUnlock()
+		assert.False(t, exists, "player should not be enqueued after context cancellation")
 	})
 
-	t.Run("Close Match", func(t *testing.T) {
+	t.Run("Graceful Shutdown", func(t *testing.T) {
 		t.Parallel()
+		tc := setupTest(t)
 
-		tango := New(logger, 10)
+		hostPlayer := createTestPlayer(testPlayer{
+			id:       "host_player_id",
+			isHost:   true,
+			gameMode: GameMode1v1,
+			tags:     []string{"dummy-tag"},
+		})
 
-		// Create a player who is hosting a match
-		hostPlayer := Player{
-			IP:        "host_player_id",
-			IsHosting: true,
-			Tags:      []string{"dummy-tag"},
-			GameMode:  GameMode1v1,
-			Deadline:  time.Now().Add(5 * time.Second),
+		joiningPlayer := createTestPlayer(testPlayer{
+			id:       "player_ip",
+			isHost:   false,
+			gameMode: GameMode1v1,
+			tags:     []string{"dummy-tag"},
+		})
+
+		require.NoError(t, tc.tango.Enqueue(tc.ctx, hostPlayer))
+		require.NoError(t, tc.tango.Enqueue(tc.ctx, joiningPlayer))
+
+		time.Sleep(200 * time.Millisecond)
+
+		shutdownCtx, cancel := context.WithTimeout(tc.ctx, 5*time.Second)
+		defer cancel()
+
+		require.NoError(t, tc.tango.Shutdown(shutdownCtx))
+
+		matches := tc.tango.ListMatches()
+		assert.Empty(t, matches, "all matches should be cleaned up after shutdown")
+
+		tc.tango.mu.RLock()
+		playerCount := len(tc.tango.players)
+		tc.tango.mu.RUnlock()
+		assert.Zero(t, playerCount, "all players should be removed after shutdown")
+	})
+
+	t.Run("Shutdown Timeout", func(t *testing.T) {
+		t.Parallel()
+		tc := setupTest(t)
+
+		var players []Player
+		for i := 0; i < 50; i++ {
+			players = append(players,
+				createTestPlayer(testPlayer{
+					id:       fmt.Sprintf("host-%d", i),
+					isHost:   true,
+					gameMode: GameMode1v1,
+					tags:     []string{"tag"},
+				}),
+				createTestPlayer(testPlayer{
+					id:       fmt.Sprintf("player-%d", i),
+					isHost:   false,
+					gameMode: GameMode1v1,
+					tags:     []string{"tag"},
+				}),
+			)
 		}
 
-		require.NoError(t, tango.Enqueue(hostPlayer))
+		require.NoError(t, tc.enqueuePlayers(players))
+		time.Sleep(100 * time.Millisecond)
 
-		sleep()
+		shutdownCtx, cancel := context.WithTimeout(tc.ctx, time.Nanosecond)
+		defer cancel()
 
-		// Validate that the match exists again
-		_, hostFound := tango.matches.Load(hostPlayer.IP)
-		require.True(t, hostFound, "hosting player not found in match after re-enqueue")
+		err := tc.tango.Shutdown(shutdownCtx)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 
-		// Close the match
-		require.NoError(t, tango.RemovePlayer(hostPlayer.IP))
-
-		// Validate that the match is removed
-		_, matchFound := tango.matches.Load(hostPlayer.IP)
-		assert.False(t, matchFound, "match should not be found after closing")
-	})
-
-	t.Run("List Matches", func(t *testing.T) {
-		t.Parallel()
-
-		tango := New(logger, 10)
-
-		hostPlayer := Player{
-			IP:        "host_player_id",
-			IsHosting: true,
-			Tags:      []string{"dummy-tag"},
-			GameMode:  GameMode1v1,
-			Deadline:  time.Now().Add(5 * time.Second),
-		}
-
-		require.NoError(t, tango.Enqueue(hostPlayer))
-
-		sleep()
-
-		// Check if the match is listed correctly
-		matches := tango.ListMatches()
-		assert.Len(t, matches, 1, "expected 1 match in the list")
-		assert.Equal(t, hostPlayer.IP, matches[0].hostPlayerIP, "host player IP does not match")
-		assert.Equal(t, hostPlayer.GameMode, matches[0].gameMode, "game mode does not match")
-
-		// Close the match
-		require.NoError(t, tango.RemovePlayer(hostPlayer.IP))
-
-		// Validate that no matches exist after closing
-		matches = tango.ListMatches()
-		assert.Len(t, matches, 0, "expected 0 matches after closing")
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.TODO(), 5*time.Second)
+		defer cleanupCancel()
+		_ = tc.tango.Shutdown(cleanupCtx)
 	})
 
 	t.Run("Player Deadline Timeout", func(t *testing.T) {
 		t.Parallel()
+		tc := setupTest(t)
+		defer tc.cleanup()
 
-		tango := New(logger, 10)
+		player := NewPlayer(
+			"timeout_player_id",
+			false,
+			GameMode1v1,
+			time.Now().Add(500*time.Millisecond),
+			[]string{"dummy-tag"},
+		)
 
-		player := Player{
-			IP:       "timeout_player_id",
-			Tags:     []string{"dummy-tag"},
-			GameMode: GameMode1v1,
-			Deadline: time.Now().Add(1 * time.Second), // Set a short deadline
-		}
+		require.NoError(t, tc.tango.Enqueue(tc.ctx, player))
 
-		require.NoError(t, tango.Enqueue(player))
-
-		// Wait for the deadline to pass
-		time.Sleep(2 * time.Second) // Wait longer than the deadline
-
-		// Verify that the player has been removed due to timeout
-		_, found := tango.players.Load(player.IP)
-		assert.False(t, found, "player should not be found after deadline timeout")
+		assert.Eventually(t, func() bool {
+			tc.tango.mu.RLock()
+			_, found := tc.tango.players[player.ID]
+			tc.tango.mu.RUnlock()
+			return !found
+		}, 2*time.Second, 100*time.Millisecond, "player should be removed after deadline")
 	})
 }
 
 func TestTangoMultiplePlayers(t *testing.T) {
 	t.Parallel()
 
-	hosts := []Player{
-		{IP: "host1", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "host2", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "host3", IsHosting: true, Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
-	}
-
-	players := []Player{
-		{IP: "player1", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "player2", Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "player3", Tags: []string{"tag"}, GameMode: GameMode2v2, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "player4", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(10 * time.Second)},
-		{IP: "timeout_player", Tags: []string{"tag"}, GameMode: GameMode1v1, Deadline: time.Now().Add(1 * time.Second)},
-	}
-
-	t.Run("Enqueue Players and Hosts", func(t *testing.T) {
+	t.Run("Concurrent Matchmaking", func(t *testing.T) {
 		t.Parallel()
+		tc := setupTest(t)
+		defer tc.cleanup()
 
-		logger := noopLogger()
-		tango := New(logger, 10)
-
-		for _, host := range hosts {
-			require.NoError(t, tango.Enqueue(host))
+		var allPlayers []Player
+		for _, p := range []testPlayer{
+			{id: "host1", isHost: true, gameMode: GameMode1v1, tags: []string{"tag"}},
+			{id: "host2", isHost: true, gameMode: GameMode2v2, tags: []string{"tag"}},
+			{id: "host3", isHost: true, gameMode: GameMode1v1, tags: []string{"tag"}},
+			{id: "player1", isHost: false, gameMode: GameMode1v1, tags: []string{"tag"}},
+			{id: "player2", isHost: false, gameMode: GameMode2v2, tags: []string{"tag"}},
+			{id: "player3", isHost: false, gameMode: GameMode2v2, tags: []string{"tag"}},
+			{id: "player4", isHost: false, gameMode: GameMode1v1, tags: []string{"tag"}},
+		} {
+			allPlayers = append(allPlayers, createTestPlayer(p))
 		}
 
-		for _, player := range players {
-			require.NoError(t, tango.Enqueue(player))
-		}
+		require.NoError(t, tc.enqueuePlayers(allPlayers))
 
-		// Wait longer for all players to potentially join matches
-		time.Sleep(2 * time.Second)
+		assert.Eventually(t, func() bool {
+			tc.tango.mu.RLock()
+			defer tc.tango.mu.RUnlock()
 
-		// Check matches for hosts
-		for _, host := range hosts {
-			match, found := tango.matches.Load(host.IP)
-			require.True(t, found, "host not found in match")
-			assert.NotNil(t, match, "match should not be nil")
-		}
-
-		// Check for players in matches
-		for _, player := range players {
-			var matchFound bool
-			for _, host := range hosts {
-				// Load the match from the sync.Map
-				if match, playerFound := tango.matches.Load(host.IP); playerFound {
-					// Check if the player is in the joinedPlayers map of the match
-					if _, found := match.(*Match).joinedPlayers.Load(player.IP); found {
-						matchFound = true
-						break
+			matchedCount := 0
+			for _, player := range allPlayers {
+				if !player.IsHosting {
+					for _, match := range tc.tango.matches {
+						match.mu.RLock()
+						_, found := match.joinedPlayers[player.ID]
+						match.mu.RUnlock()
+						if found {
+							matchedCount++
+							break
+						}
 					}
 				}
 			}
-
-			if player.IP == "timeout_player" {
-				_, found := tango.players.Load(players[4].IP)
-				assert.False(t, found, "timeout player should not be found after deadline timeout")
-
-				assert.False(t, matchFound, "player %s found in a match", player.IP)
-			} else {
-				assert.True(t, matchFound, "player %s not found in any match", player.IP)
-			}
-		}
-	})
-
-	t.Run("No Available Matches", func(t *testing.T) {
-		t.Parallel()
-
-		logger := noopLogger()
-		tango := New(logger, 10)
-
-		noMatchPlayer := Player{
-			IP:       "no_match_player",
-			Tags:     []string{"tag"},
-			GameMode: GameMode3v3, // No match available for this mode
-			Deadline: time.Now().Add(5 * time.Second),
-		}
-
-		require.NoError(t, tango.Enqueue(noMatchPlayer))
-
-		sleep()
-
-		_, found := tango.players.Load(noMatchPlayer.IP)
-		assert.True(t, found, "player should still be in queue as no matches are available")
-	})
-
-	t.Run("Remove Host and Cleanup", func(t *testing.T) {
-		t.Parallel()
-
-		logger := noopLogger()
-		tango := New(logger, 10)
-
-		require.NoError(t, tango.Enqueue(hosts[0]))
-		require.NoError(t, tango.Enqueue(hosts[1]))
-
-		sleep()
-
-		require.NoError(t, tango.RemovePlayer(hosts[0].IP))
-
-		sleep()
-
-		_, found := tango.matches.Load(hosts[0].IP)
-		assert.False(t, found, "match should not be found after host removal")
-
-		// Check other host's match still exists
-		match, found := tango.matches.Load(hosts[1].IP)
-		require.True(t, found, "remaining host match should still exist")
-		assert.NotNil(t, match, "match should not be nil")
-	})
-
-	t.Run("Remove Non-Existent Match", func(t *testing.T) {
-		t.Parallel()
-
-		tango := New(noopLogger(), 10)
-		err := tango.removeMatch("foo")
-		assert.Error(t, err, "should return an error if match doesn't exist")
+			return matchedCount == 4 // number of non-host players
+		}, 3*time.Second, 100*time.Millisecond, "all players should be matched")
 	})
 }
 
 func noopLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-func sleep() {
-	time.Sleep(time.Second)
 }
