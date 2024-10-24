@@ -5,7 +5,7 @@ Tango is experimental matchmaking service written in Go that I built for fun. It
 
 ## ⚠️ Heads Up
 
-This is an **experimental** project. I built it to explore some ideas around matchmaking and concurrent patterns in Go. While it works, I wouldn't recommend using it in production just yet. Feel free to poke around and maybe grab some ideas for your own projects.
+This is an **experimental** project. I built it to explore some ideas around matchmaking and concurrent patterns in Go. While it works, I wouldn't recommend using it in production *just yet*. Feel free to poke around and maybe grab some ideas for your own projects.
 
 ## How Tango Works
 
