@@ -12,19 +12,19 @@ This is an **experimental** project. I built it to explore some ideas around mat
 ### Flow Overview
 
 When you start Tango, it spins up two main background processes:
-1. A queue processor that handles new players/hosts
-2. A timeout checker that removes players with the expired matching timeouts
+1. An operation processor that handles new players/hosts and other match-related operations
+2. A timeout checker that removes players with expired matching timeouts
 
 ```
-                           ┌── Host → Creates new match
-Player Enqueue → Queue ────┤
-                           └── Player → Attempts to join existing match
+                               ┌── Host → Creates new match
+Player Enqueue → Operation ────┤
+                               └── Player → Attempts to join existing match
 ```
 
 Players can be either hosts (create matches) or joiners (look for matches). When a host joins:
 
-A match is created immediately
-Tango starts actively looking for suitable players to join this match
+- A match is created immediately
+- Tango starts actively looking for suitable players to join this match
 
 When a regular player joins, Tango keeps trying to find a suitable match until either:
 
@@ -83,7 +83,7 @@ import "github.com/alesr/tango"
 
 // Create a new Tango instance
 tango := tango.New(
-    tango.WithQueueSize(100),
+    tango.WithOperationBufferSize(100),
     tango.WithDefaultTimeout(5*time.Second),
     // More options available...
 )
@@ -119,18 +119,16 @@ err := tango.RemovePlayer("player-1")
 ```go
 // Get all active matches
 matches := tango.ListMatches()
-
-// Remove a player from match/queue
-err := tango.RemovePlayer("player-1")
 ```
 
 ### Configuration Options
 
-- `WithLogger`: Custom logger for the service
-- `WithQueueSize`: Size of the player queue
-- `WithAttemptToJoinFrequency`: How often to try matching players
-- `WithCheckDeadlinesFrequency`: How often to check for timeouts
-- `WithDefaultTimeout`: Default operation timeout
+    - WithLogger: Custom logger for the service
+    - WithOperationBufferSize: Size of the operation channel buffer
+    - WithMatchBufferSize: Size of the match channel buffer
+    - WithAttemptToJoinFrequency: How often to try matching players
+    - WithCheckDeadlinesFrequency: How often to check for timeouts
+    - WithDefaultTimeout: Default operation timeout
 
 ### Game Modes
 
