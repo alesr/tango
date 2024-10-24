@@ -57,10 +57,10 @@ func createTestPlayer(cfg testPlayer) Player {
 func (tc *testContext) assertPlayerInMatch(hostID, playerID string) bool {
 	tc.t.Helper()
 
-	tc.tango.mu.RLock()
-	defer tc.tango.mu.RUnlock()
+	tc.tango.state.RLock()
+	defer tc.tango.state.RUnlock()
 
-	match, exists := tc.tango.matches[hostID]
+	match, exists := tc.tango.state.matches[hostID]
 	if !exists {
 		return false
 	}
@@ -68,7 +68,7 @@ func (tc *testContext) assertPlayerInMatch(hostID, playerID string) bool {
 	match.mu.RLock()
 	defer match.mu.RUnlock()
 
-	_, found := match.joinedPlayers[playerID]
+	_, found := match.joinedPlayers.Load(playerID)
 	return found && match.availableSlots == 0
 }
 
@@ -138,9 +138,10 @@ func TestTangoMatchmaking(t *testing.T) {
 		err := tc.tango.Enqueue(ctx, player)
 		assert.ErrorIs(t, err, context.Canceled, "should return context.Canceled error")
 
-		tc.tango.mu.RLock()
-		_, exists := tc.tango.players[player.ID]
-		tc.tango.mu.RUnlock()
+		tc.tango.state.RLock()
+		_, exists := tc.tango.state.players[player.ID]
+
+		tc.tango.state.RUnlock()
 		assert.False(t, exists, "player should not be enqueued after context cancellation")
 	})
 
@@ -172,12 +173,12 @@ func TestTangoMatchmaking(t *testing.T) {
 
 		require.NoError(t, tc.tango.Shutdown(shutdownCtx))
 
-		matches := tc.tango.ListMatches()
-		assert.Empty(t, matches, "all matches should be cleaned up after shutdown")
+		_, err := tc.tango.ListMatches()
+		assert.ErrorIs(t, err, errServiceNotStarted)
 
-		tc.tango.mu.RLock()
-		playerCount := len(tc.tango.players)
-		tc.tango.mu.RUnlock()
+		tc.tango.state.RLock()
+		playerCount := len(tc.tango.state.players)
+		tc.tango.state.RUnlock()
 		assert.Zero(t, playerCount, "all players should be removed after shutdown")
 	})
 
@@ -233,9 +234,9 @@ func TestTangoMatchmaking(t *testing.T) {
 		require.NoError(t, tc.tango.Enqueue(tc.ctx, player))
 
 		assert.Eventually(t, func() bool {
-			tc.tango.mu.RLock()
-			_, found := tc.tango.players[player.ID]
-			tc.tango.mu.RUnlock()
+			tc.tango.state.RLock()
+			_, found := tc.tango.state.players[player.ID]
+			tc.tango.state.RUnlock()
 			return !found
 		}, 2*time.Second, 100*time.Millisecond, "player should be removed after deadline")
 	})
@@ -265,15 +266,15 @@ func TestTangoMultiplePlayers(t *testing.T) {
 		require.NoError(t, tc.enqueuePlayers(allPlayers))
 
 		assert.Eventually(t, func() bool {
-			tc.tango.mu.RLock()
-			defer tc.tango.mu.RUnlock()
+			tc.tango.state.RLock()
+			defer tc.tango.state.RUnlock()
 
 			matchedCount := 0
 			for _, player := range allPlayers {
 				if !player.IsHosting {
-					for _, match := range tc.tango.matches {
+					for _, match := range tc.tango.state.matches {
 						match.mu.RLock()
-						_, found := match.joinedPlayers[player.ID]
+						_, found := match.joinedPlayers.Load(player.ID)
 						match.mu.RUnlock()
 						if found {
 							matchedCount++

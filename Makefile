@@ -5,8 +5,10 @@ MEM_PROFILE := $(BENCH_DIR)/mem.pb.gz
 CPU_PROFILE := $(BENCH_DIR)/cpu.pb.gz
 BLOCK_PROFILE := $(BENCH_DIR)/block.pb.gz
 MUTEX_PROFILE := $(BENCH_DIR)/mutex.pb.gz
-
 TANGO_PKG := github.com/alesr/tango
+
+test:
+	go test -v -race -count=1 ./...
 
 bench:
 	@mkdir -p $(BENCH_DIR)

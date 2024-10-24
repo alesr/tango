@@ -14,6 +14,7 @@ const (
 // with the host always occupying one slot.
 type GameMode string
 
+// availableSlotsPerGameMode returns the number of available slots for a given game mode.
 func availableSlotsPerGameMode(gm GameMode) int {
 	switch gm {
 	case GameMode1v1:

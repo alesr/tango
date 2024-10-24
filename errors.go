@@ -27,7 +27,7 @@ type (
 var (
 	errInvalidQueueSize      = InvalidQueueSizeError{newTangoError("queue size must be greater than 0")}
 	errPlayerAlreadyEnqueued = PlayerAlreadyEnqueuedError{newTangoError("player already enqueued")}
-	errServiceAlreadyStarted = ServiceNotStartedError{newTangoError("tango service already started")}
+	errServiceAlreadyStarted = ServiceAlreadyStartedError{newTangoError("tango service already started")}
 	errServiceNotStarted     = ServiceNotStartedError{newTangoError("tango service not started")}
 	errPlayerNotFound        = PlayerNotFoundError{newTangoError("player not found")}
 )
