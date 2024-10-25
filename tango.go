@@ -262,6 +262,14 @@ func (t *Tango) processOperations() {
 	}
 }
 
+func (t *Tango) isStarted() bool {
+	return t.started.Load()
+}
+
+func (t *Tango) getAttemptFrequency() time.Duration {
+	return t.attemptToJoinFrequency
+}
+
 // handleEnqueue adds a player to the system and initiates the matchmaking process.
 func (t *Tango) handleEnqueue(op operation) {
 	t.state.Lock()
