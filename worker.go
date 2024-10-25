@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// matchFinder defines the interface for finding and joining matches
+type matchFinder interface {
+	findSuitableMatch(player Player) *match
+	RemovePlayer(playerID string) error
+	isStarted() bool
+	getAttemptFrequency() time.Duration
+}
+
 // matchJob represents a job for finding a match for a player
 type matchJob struct {
 	player   Player
@@ -19,26 +27,26 @@ type matchWorkerPool struct {
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
-	tango      *Tango
+	finder     matchFinder
 }
 
 // newMatchWorkerPool creates a new worker pool for matchmaking
-func newMatchWorkerPool(numWorkers int, jobBuffer int, t *Tango) *matchWorkerPool {
+func newMatchWorkerPool(numWorkers int, jobBuffer int, finder matchFinder) *matchWorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pool := matchWorkerPool{
+	pool := &matchWorkerPool{
 		numWorkers: numWorkers,
 		jobCh:      make(chan matchJob, jobBuffer),
 		ctx:        ctx,
 		cancel:     cancel,
-		tango:      t,
+		finder:     finder,
 	}
 
 	pool.start()
-	return &pool
+	return pool
 }
 
-// start initializes and starts the worker pool.
+// start initializes and starts the worker pool
 func (p *matchWorkerPool) start() {
 	p.wg.Add(p.numWorkers)
 	for i := 0; i < p.numWorkers; i++ {
@@ -46,7 +54,7 @@ func (p *matchWorkerPool) start() {
 	}
 }
 
-// shutdown gracefully shuts down the worker pool.
+// shutdown gracefully shuts down the worker pool
 func (p *matchWorkerPool) shutdown() {
 	p.cancel()
 	close(p.jobCh)
@@ -63,7 +71,7 @@ func (p *matchWorkerPool) submit(player Player) {
 	}
 }
 
-// worker processes matchmaking jobs.
+// worker processes matchmaking jobs
 func (p *matchWorkerPool) worker() {
 	defer p.wg.Done()
 
@@ -82,7 +90,7 @@ func (p *matchWorkerPool) worker() {
 
 // processJob handles the matchmaking attempt for a single player
 func (p *matchWorkerPool) processJob(job matchJob) {
-	ticker := time.NewTicker(p.tango.attemptToJoinFrequency)
+	ticker := time.NewTicker(p.finder.getAttemptFrequency())
 	defer ticker.Stop()
 
 	timeoutCh := time.After(time.Until(job.deadline))
@@ -90,14 +98,14 @@ func (p *matchWorkerPool) processJob(job matchJob) {
 	for {
 		select {
 		case <-timeoutCh:
-			_ = p.tango.RemovePlayer(job.player.ID)
+			_ = p.finder.RemovePlayer(job.player.ID)
 			return
 		case <-ticker.C:
-			if !p.tango.started.Load() {
+			if !p.finder.isStarted() {
 				return
 			}
 
-			if match := p.tango.findSuitableMatch(job.player); match != nil {
+			if match := p.finder.findSuitableMatch(job.player); match != nil {
 				respCh := make(chan matchResponse)
 
 				select {
