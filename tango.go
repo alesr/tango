@@ -9,15 +9,15 @@ import (
 	"time"
 )
 
-// operationType defines the types of operations that can be performed
-type operationType int
-
 const (
 	opEnqueuePlayer operationType = iota + 1
 	opRemovePlayer
 	opListMatches
 	opTimeout
 )
+
+// operationType defines the types of operations that can be performed
+type operationType int
 
 // operation represents a request to modify system state
 type operation struct {
@@ -56,6 +56,9 @@ type Tango struct {
 
 	// Match pooling
 	matchPool sync.Pool
+
+	// Worker pool for matchmaking
+	matchWorkers *matchWorkerPool
 
 	// Runtime control
 	shutdown sync.Once
@@ -97,6 +100,11 @@ func (t *Tango) Start() error {
 		return errServiceAlreadyStarted
 	}
 
+	// Initialize worker pool if not set
+	if t.matchWorkers == nil {
+		t.matchWorkers = newMatchWorkerPool(defaultNumWorkers, defaultJobBufferSize, t)
+	}
+
 	t.wg.Add(2)
 	go t.processOperations()
 	go t.processTimeouts()
@@ -116,6 +124,11 @@ func (t *Tango) Shutdown(ctx context.Context) error {
 	t.shutdown.Do(func() {
 		t.started.Store(false)
 
+		// Shutdown worker pool first
+		if t.matchWorkers != nil {
+			t.matchWorkers.shutdown()
+		}
+
 		// First stop accepting new operations
 		close(t.doneCh)
 
@@ -128,7 +141,7 @@ func (t *Tango) Shutdown(ctx context.Context) error {
 			t.cleanupMatchesAndPlayers(ctx)
 		}()
 
-		// Wait for cleanup or context cancellation
+		// Wait for cleanup  done or context cancellation
 		done := make(chan struct{})
 		go func() {
 			cleanupWg.Wait()
@@ -258,7 +271,7 @@ func (t *Tango) handleEnqueue(op operation) {
 		return
 	}
 
-	// Store player first
+	// Store player
 	t.state.players[op.player.ID] = op.player
 	t.state.Unlock()
 
@@ -268,7 +281,7 @@ func (t *Tango) handleEnqueue(op operation) {
 		t.state.matches[op.player.ID] = match
 		t.state.Unlock()
 	} else {
-		go t.attemptToJoinMatch(op.player)
+		t.matchWorkers.submit(op.player)
 	}
 
 	t.logger.Info("Player enqueued", slog.String("player", op.player.String()))
@@ -278,17 +291,17 @@ func (t *Tango) handleEnqueue(op operation) {
 // handleRemove removes a player from the system and cleans up any associated matches.
 func (t *Tango) handleRemove(op operation) {
 	t.state.Lock()
-	_, exists := t.state.players[op.playerID]
-	if !exists {
+
+	if _, exists := t.state.players[op.playerID]; !exists {
 		t.state.Unlock()
 		op.respCh <- response{err: errPlayerNotFound}
 		return
 	}
 
 	delete(t.state.players, op.playerID)
+
 	t.state.Unlock()
 
-	// Handle match cleanup if needed
 	match, isHost := t.findMatchForPlayer(op.playerID)
 	if match != nil {
 		if isHost {
@@ -320,7 +333,7 @@ func (t *Tango) processTimeouts() {
 	ticker := time.NewTicker(t.checkDeadlinesFrequency)
 	defer ticker.Stop()
 
-	// TODO(alesr): pass channel size via config.
+	// TODO: fix magic number
 	expired := make([]string, 0, 32)
 
 	for {
@@ -347,58 +360,14 @@ func (t *Tango) processTimeouts() {
 	}
 }
 
-// attemptToJoinMatch tries to find a match for a player and adds them if a suitable match is found.
-func (t *Tango) attemptToJoinMatch(player Player) {
-	ticker := time.NewTicker(t.attemptToJoinFrequency)
-	defer ticker.Stop()
-
-	timeoutCh := time.After(time.Until(time.Unix(player.timeout, 0)))
-
-	for {
-		select {
-		case <-timeoutCh:
-			_ = t.RemovePlayer(player.ID)
-			return
-		case <-ticker.C:
-			if !t.started.Load() {
-				return
-			}
-
-			if match := t.findSuitableMatch(player); match != nil {
-				respCh := make(chan matchResponse)
-
-				select {
-				case match.requestCh <- matchRequest{
-					op:     matchJoin,
-					player: player,
-					respCh: respCh,
-				}:
-					select {
-					case resp := <-respCh:
-						if resp.success {
-							return
-						}
-					case <-t.doneCh:
-						return
-					}
-				case <-t.doneCh:
-					return
-				}
-			}
-		case <-t.doneCh:
-			return
-		}
-	}
-}
-
-// findSuitableMatch searches for a match that has the same game mode and available slots for the given player.
+// findSuitableMatch searches for a match that has the same
+// game mode and available slots for the given player.
+// TODO: extend this to consider tags
 func (t *Tango) findSuitableMatch(player Player) *match {
 	t.state.RLock()
 	defer t.state.RUnlock()
 
-	// Check all matches in a deterministic order
 	for _, m := range t.state.matches {
-		// Verify game mode and available slots before attempting to join
 		m.mu.RLock()
 		if m.gameMode == player.GameMode && m.availableSlots > 0 {
 			m.mu.RUnlock()
@@ -413,11 +382,11 @@ func (t *Tango) findSuitableMatch(player Player) *match {
 func (t *Tango) createMatch(player Player) *match {
 	match := t.matchPool.Get().(*match)
 
-	// Initialize match before starting goroutine
 	match.mu.Lock()
 	match.hostPlayerID = player.ID
 	match.availableSlots = uint8(availableSlotsPerGameMode(player.GameMode))
 	match.gameMode = player.GameMode
+	match.tagCount = uint8(len(player.tags)) // safe since we only store up to 'maxTags'
 	match.tagCount = player.tagCount
 	copy(match.tags[:], player.tags[:player.tagCount])
 	match.joinedPlayers = sync.Map{}
@@ -426,7 +395,6 @@ func (t *Tango) createMatch(player Player) *match {
 	match.closed.Store(false)
 	match.mu.Unlock()
 
-	// Start match goroutine after full initialization
 	go match.run()
 
 	return match

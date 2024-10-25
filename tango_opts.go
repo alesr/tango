@@ -13,10 +13,11 @@ const (
 	defaultTimeout                 = 5 * time.Second
 	defaultOpBufferSize            = 100 // Buffer size for operation channels
 	defaultMatchBufferSize         = 100 // Buffer size for match channels
+	defaultNumWorkers              = 10
+	defaultJobBufferSize           = 1000
 )
 
-// Options defines the function for applying
-// optinal confifuration to the Tango instance.
+// Options defines the function for applying optional configuration to the Tango instance.
 type Option func(*Tango)
 
 // WithLogger sets the logger for Tango.
@@ -83,5 +84,18 @@ func WithDefaultTimeout(timeout time.Duration) Option {
 			timeout = defaultTimeout
 		}
 		t.defaultTimeout = timeout
+	}
+}
+
+// WithWorkerPool sets the configuration for the matchmaking worker pool.
+func WithWorkerPool(numWorkers, jobBufferSize int) Option {
+	return func(t *Tango) {
+		if numWorkers <= 0 {
+			numWorkers = defaultNumWorkers
+		}
+		if jobBufferSize <= 0 {
+			jobBufferSize = defaultJobBufferSize
+		}
+		t.matchWorkers = newMatchWorkerPool(numWorkers, jobBufferSize, t)
 	}
 }
