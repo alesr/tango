@@ -1,8 +1,6 @@
 # Tango
 [![codecov](https://codecov.io/gh/alesr/tango/branch/main/graph/badge.svg)](https://codecov.io/gh/alesr/tango)
 
-Tango is experimental matchmaking service written in Go that I built for fun. It handles player queues and match creation with a focus on concurrent operations.
-
 ## ⚠️ Heads Up
 
 This is an **experimental** project. I built it to explore some ideas around matchmaking and concurrent patterns in Go. While it works, I wouldn't recommend using it in production *just yet*. Feel free to poke around and maybe grab some ideas for your own projects.
