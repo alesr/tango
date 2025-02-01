@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"testing"
 	"time"
+
+	"github.com/alesr/tango/pkg/loggerutil"
 )
 
 func BenchmarkMatchmaking(b *testing.B) {
@@ -49,7 +51,7 @@ func BenchmarkMatchmaking(b *testing.B) {
 	}
 
 	tango := New(
-		WithLogger(noopLogger()),
+		WithLogger(loggerutil.NoopLogger()),
 		WithAttemptToJoinFrequency(time.Millisecond*100),
 		WithCheckDeadlinesFrequency(time.Millisecond*100),
 	)
