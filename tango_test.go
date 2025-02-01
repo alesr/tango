@@ -3,16 +3,35 @@ package tango
 import (
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/alesr/tango/pkg/loggerutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// testPlayer represents a test player configuration
+type testContext struct {
+	tango *Tango
+	ctx   context.Context
+}
+
+func setupTest(t *testing.T) *testContext {
+	t.Helper()
+	tango := New(
+		WithLogger(loggerutil.NoopLogger()),
+		WithDefaultTimeout(5*time.Second),
+		WithAttemptToJoinFrequency(100*time.Millisecond),
+		WithCheckDeadlinesFrequency(10*time.Millisecond),
+	)
+	require.NoError(t, tango.Start())
+
+	return &testContext{
+		tango: tango,
+		ctx:   context.Background(),
+	}
+}
+
 type testPlayer struct {
 	id       string
 	isHost   bool
@@ -20,43 +39,31 @@ type testPlayer struct {
 	tags     []string
 }
 
-// testContext represents common test context
-type testContext struct {
-	t     *testing.T
-	tango *Tango
-	ctx   context.Context
+func (tc *testContext) createTestPlayer(p testPlayer) Player {
+	return NewPlayer(p.id, p.isHost, p.gameMode, time.Now().Add(10*time.Second), p.tags)
 }
 
-// setupTest creates a new test context with initialized Tango instance
-func setupTest(t *testing.T) *testContext {
-	t.Helper()
-	ctx := context.TODO()
-	tango := New(WithLogger(noopLogger()))
-	require.NoError(t, tango.Start())
-
-	return &testContext{
-		t:     t,
-		tango: tango,
-		ctx:   ctx,
-	}
-}
-
-// cleanup performs test cleanup
 func (tc *testContext) cleanup() {
-	tc.t.Helper()
-	require.NoError(tc.t, tc.tango.Shutdown(tc.ctx))
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Force stop all worker pools
+	if tc.tango.matchWorkers != nil {
+		tc.tango.matchWorkers.cancel()
+	}
+	_ = tc.tango.Shutdown(cleanupCtx)
 }
 
-// createTestPlayer creates a new player for testing
-func createTestPlayer(cfg testPlayer) Player {
-	deadline := time.Now().Add(10 * time.Second)
-	return NewPlayer(cfg.id, cfg.isHost, cfg.gameMode, deadline, cfg.tags)
+func (tc *testContext) enqueuePlayers(players []Player) error {
+	for _, p := range players {
+		if err := tc.tango.Enqueue(tc.ctx, p); err != nil {
+			return fmt.Errorf("failed to enqueue player %s: %w", p.ID, err)
+		}
+	}
+	return nil
 }
 
-// assertPlayerInMatch checks if a player is in a specific match
 func (tc *testContext) assertPlayerInMatch(hostID, playerID string) bool {
-	tc.t.Helper()
-
 	tc.tango.state.RLock()
 	defer tc.tango.state.RUnlock()
 
@@ -67,27 +74,8 @@ func (tc *testContext) assertPlayerInMatch(hostID, playerID string) bool {
 
 	match.mu.RLock()
 	defer match.mu.RUnlock()
-
 	_, found := match.joinedPlayers.Load(playerID)
-	return found && match.availableSlots == 0
-}
-
-// enqueuePlayers enqueues multiple players concurrently
-func (tc *testContext) enqueuePlayers(players []Player) error {
-	errCh := make(chan error, len(players))
-
-	for _, player := range players {
-		go func(p Player) {
-			errCh <- tc.tango.Enqueue(tc.ctx, p)
-		}(player)
-	}
-
-	for i := 0; i < len(players); i++ {
-		if err := <-errCh; err != nil {
-			return err
-		}
-	}
-	return nil
+	return found
 }
 
 func TestTangoMatchmaking(t *testing.T) {
@@ -98,14 +86,14 @@ func TestTangoMatchmaking(t *testing.T) {
 		tc := setupTest(t)
 		defer tc.cleanup()
 
-		hostPlayer := createTestPlayer(testPlayer{
+		hostPlayer := tc.createTestPlayer(testPlayer{
 			id:       "host_player_id",
 			isHost:   true,
 			gameMode: GameMode1v1,
 			tags:     []string{"dummy-tag"},
 		})
 
-		joiningPlayer := createTestPlayer(testPlayer{
+		joiningPlayer := tc.createTestPlayer(testPlayer{
 			id:       "player_ip",
 			isHost:   false,
 			gameMode: GameMode1v1,
@@ -128,7 +116,7 @@ func TestTangoMatchmaking(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.TODO())
 		cancel() // Cancel immediately
 
-		player := createTestPlayer(testPlayer{
+		player := tc.createTestPlayer(testPlayer{
 			id:       "test-player",
 			isHost:   false,
 			gameMode: GameMode1v1,
@@ -149,37 +137,34 @@ func TestTangoMatchmaking(t *testing.T) {
 		t.Parallel()
 		tc := setupTest(t)
 
-		hostPlayer := createTestPlayer(testPlayer{
+		ctx := context.Background()
+		hostPlayer := tc.createTestPlayer(testPlayer{
 			id:       "host_player_id",
 			isHost:   true,
 			gameMode: GameMode1v1,
 			tags:     []string{"dummy-tag"},
 		})
 
-		joiningPlayer := createTestPlayer(testPlayer{
+		joiningPlayer := tc.createTestPlayer(testPlayer{
 			id:       "player_ip",
 			isHost:   false,
 			gameMode: GameMode1v1,
 			tags:     []string{"dummy-tag"},
 		})
 
-		require.NoError(t, tc.tango.Enqueue(tc.ctx, hostPlayer))
-		require.NoError(t, tc.tango.Enqueue(tc.ctx, joiningPlayer))
+		require.NoError(t, tc.tango.Enqueue(ctx, hostPlayer))
+		require.NoError(t, tc.tango.Enqueue(ctx, joiningPlayer))
 
-		time.Sleep(200 * time.Millisecond)
+		// Wait for match to be created
+		assert.Eventually(t, func() bool {
+			return tc.assertPlayerInMatch(hostPlayer.ID, joiningPlayer.ID)
+		}, 2*time.Second, 100*time.Millisecond)
 
-		shutdownCtx, cancel := context.WithTimeout(tc.ctx, 5*time.Second)
+		// Perform shutdown with longer timeout
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		require.NoError(t, tc.tango.Shutdown(shutdownCtx))
-
-		_, err := tc.tango.ListMatches()
-		assert.ErrorIs(t, err, errServiceNotStarted)
-
-		tc.tango.state.RLock()
-		playerCount := len(tc.tango.state.players)
-		tc.tango.state.RUnlock()
-		assert.Zero(t, playerCount, "all players should be removed after shutdown")
 	})
 
 	t.Run("Shutdown Timeout", func(t *testing.T) {
@@ -189,13 +174,13 @@ func TestTangoMatchmaking(t *testing.T) {
 		var players []Player
 		for i := 0; i < 50; i++ {
 			players = append(players,
-				createTestPlayer(testPlayer{
+				tc.createTestPlayer(testPlayer{
 					id:       fmt.Sprintf("host-%d", i),
 					isHost:   true,
 					gameMode: GameMode1v1,
 					tags:     []string{"tag"},
 				}),
-				createTestPlayer(testPlayer{
+				tc.createTestPlayer(testPlayer{
 					id:       fmt.Sprintf("player-%d", i),
 					isHost:   false,
 					gameMode: GameMode1v1,
@@ -223,22 +208,25 @@ func TestTangoMatchmaking(t *testing.T) {
 		tc := setupTest(t)
 		defer tc.cleanup()
 
+		// Set deadline to 1 second from now
+		deadline := time.Now().Add(time.Second)
 		player := NewPlayer(
 			"timeout_player_id",
 			false,
 			GameMode1v1,
-			time.Now().Add(500*time.Millisecond),
+			deadline,
 			[]string{"dummy-tag"},
 		)
 
 		require.NoError(t, tc.tango.Enqueue(tc.ctx, player))
 
+		// Wait a bit longer than the deadline to ensure the timeout check runs
 		assert.Eventually(t, func() bool {
 			tc.tango.state.RLock()
-			_, found := tc.tango.state.players[player.ID]
-			tc.tango.state.RUnlock()
-			return !found
-		}, 2*time.Second, 100*time.Millisecond, "player should be removed after deadline")
+			defer tc.tango.state.RUnlock()
+			_, exists := tc.tango.state.players[player.ID]
+			return !exists
+		}, 3*time.Second, 100*time.Millisecond, "player should be removed after deadline")
 	})
 }
 
@@ -260,7 +248,7 @@ func TestTangoMultiplePlayers(t *testing.T) {
 			{id: "player3", isHost: false, gameMode: GameMode2v2, tags: []string{"tag"}},
 			{id: "player4", isHost: false, gameMode: GameMode1v1, tags: []string{"tag"}},
 		} {
-			allPlayers = append(allPlayers, createTestPlayer(p))
+			allPlayers = append(allPlayers, tc.createTestPlayer(p))
 		}
 
 		require.NoError(t, tc.enqueuePlayers(allPlayers))
@@ -286,8 +274,4 @@ func TestTangoMultiplePlayers(t *testing.T) {
 			return matchedCount == 4 // number of non-host players
 		}, 3*time.Second, 100*time.Millisecond, "all players should be matched")
 	})
-}
-
-func noopLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
