@@ -14,7 +14,7 @@ const (
 	defaultOpBufferSize            = 100 // Buffer size for operation channels
 	defaultMatchBufferSize         = 100 // Buffer size for match channels
 	defaultNumWorkers              = 10
-	defaultJobBufferSize           = 1000
+	defaultJobBufferSize           = 1000 // TODO: Investigate a strategy to infer a suitable buffer size
 )
 
 // Options defines the function for applying optional configuration to the Tango instance.
@@ -97,5 +97,14 @@ func WithWorkerPool(numWorkers, jobBufferSize int) Option {
 			jobBufferSize = defaultJobBufferSize
 		}
 		t.matchWorkers = newMatchWorkerPool(numWorkers, jobBufferSize, t)
+	}
+}
+
+// WithStatsUpdateInterval sets how frequently stats are updated
+func WithStatsUpdateInterval(interval time.Duration) Option {
+	return func(t *Tango) {
+		if interval > 0 {
+			t.statsUpdateInterval = interval
+		}
 	}
 }

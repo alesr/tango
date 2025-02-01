@@ -1,4 +1,5 @@
 # Tango
+
 [![codecov](https://codecov.io/gh/alesr/tango/branch/main/graph/badge.svg)](https://codecov.io/gh/alesr/tango)
 
 ## ⚠️ Heads Up
@@ -9,11 +10,15 @@ This is an **experimental** project. I built it to explore some ideas around mat
 
 ### Flow Overview
 
-When you start Tango, it spins up two main background processes:
+When you start Tango, it spins up three main background processes:
+
 1. An operation processor that handles new players/hosts and other match-related operations
 2. A timeout checker that removes players with expired matching timeouts
+3. A stats updater that periodically collects matchup statistics
 
-```
+> **Note**: The diagrams below only show the operation processor and timeout checker for simplicity.
+
+```bash
                                ┌── Host → Creates new match
 Player Enqueue → Operation ────┤
                                └── Player → Attempts to join existing match
@@ -38,18 +43,26 @@ flowchart TB
     subgraph Matchmaking
         Start[Start Tango] --> Queue{Player Queue}
         Queue -->|Host| CreateMatch[Create Match]
-        CreateMatch --> SeekPlayers[Seek Players]
-        Queue -->|Player| FindMatch[Find Match]
+        Queue -->|Player| WorkerPool[Worker Pool]
+        
+        CreateMatch -->|From Pool| NewMatch[New Match]
+        NewMatch --> SeekPlayers[Seek Players]
+        
+        WorkerPool -->|Attempts| FindMatch[Find Match]
         FindMatch -->|Success| JoinMatch[Join Match]
-        FindMatch --> |No Match| Retry((Retry))
+        FindMatch -->|No Match| Retry((Retry))
         Retry --> FindMatch
+        
         SeekPlayers -->|Match Found| JoinMatch
+        
+        JoinMatch --> Stats[Update Stats]
     end
 
     style Start fill:#48BB78,color:#2F855A
     style Queue fill:#667EEA,color:#F7FAFC
+    style WorkerPool fill:#9F7AEA,color:#F7FAFC
     style JoinMatch fill:#48BB78,color:#2F855A
-    style Retry fill:#9F7AEA,color:#F7FAFC
+    style Stats fill:#4299E1,color:#F7FAFC
     style Matchmaking fill:#EBF8FF,color:#2C5282
 ```
 
@@ -62,15 +75,24 @@ flowchart TB
         Timer[Timeout Checker] --> CheckPlayers{Check Players}
         CheckPlayers -->|Expired| RemovePlayer[Remove Player]
         CheckPlayers -->|Active| Continue[Continue Checking]
+        
         RemovePlayer -->|Is Host| CleanMatch[Cleanup Match]
         RemovePlayer -->|Not Host| DeletePlayer[Delete Player]
+        
+        CleanMatch --> Events[Emit Events]
         CleanMatch --> ReturnMatchPool[Return Match to Pool]
+        CleanMatch --> UpdateStats[Update Stats]
+        
+        DeletePlayer --> Events
+        DeletePlayer --> UpdateStats
     end
 
     style Timer fill:#4299E1,color:#F7FAFC
     style ReturnMatchPool fill:#ED64A6,color:#F7FAFC
     style CleanMatch fill:#9F7AEA,color:#F7FAFC
     style DeletePlayer fill:#ED8936,color:#F7FAFC
+    style Events fill:#48BB78,color:#2F855A
+    style UpdateStats fill:#667EEA,color:#F7FAFC
     style Cleanup fill:#F0FFF4,color:#2C5282
 ```
 
@@ -119,14 +141,25 @@ err := tango.RemovePlayer("player-1")
 matches := tango.ListMatches()
 ```
 
+### Stats
+
+You can call the Stats() method at any time to retrieve match statistics:
+
+```go
+stats, _ := tango.Stats(ctx)
+
+fmt.Printf("Total Players: %d\n", stats.TotalPlayers)
+fmt.Printf("Total Matches: %d\n", stats.TotalMatches)
+```
+
 ### Configuration Options
 
-    - WithLogger: Custom logger for the service
-    - WithOperationBufferSize: Size of the operation channel buffer
-    - WithMatchBufferSize: Size of the match channel buffer
-    - WithAttemptToJoinFrequency: How often to try matching players
-    - WithCheckDeadlinesFrequency: How often to check for timeouts
-    - WithDefaultTimeout: Default operation timeout
+- WithLogger: Custom logger for the service
+- WithOperationBufferSize: Size of the operation channel buffer
+- WithMatchBufferSize: Size of the match channel buffer
+- WithAttemptToJoinFrequency: How often to try matching players
+- WithCheckDeadlinesFrequency: How often to check for timeouts
+- WithDefaultTimeout: Default operation timeout
 
 ### Game Modes
 
@@ -148,12 +181,38 @@ Some cool ideas I'd like to explore:
 
 Got more ideas? I'd love to hear them!
 
-## Performance
+## Load Testing
 
-I've included some benchmarks for exploration, but given the concurrent nature of the system, take the numbers with a grain of salt. If you're curious:
+To make sure Tango works well under different conditions, i've set up some load tests. These tests are there to simulate various scenarios and see how the system handles them.
+
+### Running Load Tests
+
+You can run the load tests using this command:
 
 ```bash
-make bench      # Run benchmarks
-make pprof-cpu  # CPU profile analysis
-make pprof-mem  # Memory profile analysis
+make test-load
 ```
+
+This will execute all the test cases in the `loadtest` package.
+
+### Configuring Load Tests
+
+The load testing framework is flexible. You can adjust various parameters like the number of requests, concurrency level, duration, and more through a configuration struct:
+
+```go
+type Config struct {
+    Requests           int
+    ConcurrentRequests int
+    Duration           time.Duration
+    StatsInterval      time.Duration
+    RequestsPerSecond  float64
+    Scenario           string
+}
+```
+
+### Example Scenarios
+
+I have a few predefined scenarios to simulate different types of workloads:
+
+- **High Concurrency**: Simulates many concurrent requests with a specified rate limit.
+- **Host Heavy**: Focuses on creating matches where most players are hosts.
