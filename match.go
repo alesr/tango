@@ -36,8 +36,8 @@ type matchResponse struct {
 // match represents a game match with a host, joined players, and game mode details.
 type match struct {
 	hostPlayerID       string
-	joinedPlayers      sync.Map // Use sync.Map instead of map[string]struct{}
-	joinedPlayersCount int32    // Keep track of the number of joined players
+	joinedPlayers      sync.Map
+	joinedPlayersCount int32
 	availableSlots     uint8
 	tags               [maxTags]string
 	tagCount           uint8
@@ -64,9 +64,8 @@ func newMatch(host Player, slots uint8) *match {
 		closed:         atomic.Bool{},
 	}
 
-	// Copy tags safely before starting goroutine
+	// Set host tags as match tags
 	copy(m.tags[:], host.tags[:host.tagCount])
-
 	return m
 }
 
@@ -116,7 +115,8 @@ func (m *match) handleJoin(req matchRequest) {
 	req.respCh <- matchResponse{success: true}
 }
 
-// handleLeave removes a player from the match. If the player is the host, it returns true to signal the match should be closed.
+// handleLeave removes a player from the match.
+// If the player is the host, it returns true to signal the match should be closed.
 func (m *match) handleLeave(req matchRequest) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

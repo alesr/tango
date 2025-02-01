@@ -1,27 +1,47 @@
 package tango
 
+// GameMode represents different types of game modes available
+type GameMode uint8
+
 const (
-	// GameMode1v1 represents a 1v1 match type.
-	GameMode1v1 GameMode = "1v1"
-	// GameMode2v2 represents a 2v2 match type.
-	GameMode2v2 GameMode = "2v2"
-	// GameMode3v3 represents a 3v3 match type.
-	GameMode3v3 GameMode = "3v3"
+	GameModeUnknown GameMode = iota
+	GameMode1v1
+	GameMode2v2
+	GameMode3v3
 )
 
-// GameMode defines different game modes for matches.
-// The game mode determines the number of available slots in a match,
-// with the host always occupying one slot.
-type GameMode string
+// String returns the string representation of a GameMode
+func (g GameMode) String() string {
+	switch g {
+	case GameMode1v1:
+		return "1v1"
+	case GameMode2v2:
+		return "2v2"
+	case GameMode3v3:
+		return "3v3"
+	default:
+		return "Unknown"
+	}
+}
 
-// availableSlotsPerGameMode returns the number of available slots for a given game mode.
-func availableSlotsPerGameMode(gm GameMode) int {
-	switch gm {
+// AllGameModes contains a map of all available game modes
+var AllGameModes = map[GameMode]struct{}{
+	GameModeUnknown: {},
+	GameMode1v1:     {},
+	GameMode2v2:     {},
+	GameMode3v3:     {},
+}
+
+// availableSlotsPerGameMode returns the number of available slots for a game mode
+func availableSlotsPerGameMode(mode GameMode) int {
+	switch mode {
 	case GameMode1v1:
 		return 1
 	case GameMode2v2:
 		return 3
-	default:
+	case GameMode3v3:
 		return 5
+	default:
+		return 0
 	}
 }

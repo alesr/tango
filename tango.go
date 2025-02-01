@@ -14,6 +14,7 @@ const (
 	opRemovePlayer
 	opListMatches
 	opTimeout
+	opStats
 )
 
 // operationType defines the types of operations that can be performed
@@ -32,6 +33,19 @@ type operation struct {
 type response struct {
 	data any
 	err  error
+}
+
+// Stats holds information about the current state of matches
+type Stats struct {
+	MatchesByGameMode map[GameMode]GameModeStats
+	TotalMatches      int
+	TotalPlayers      int
+}
+
+type GameModeStats struct {
+	ActiveMatches int
+	OpenSlots     int
+	PlayersJoined int
 }
 
 // Tango manages players, matches, and matchmaking.
@@ -64,6 +78,14 @@ type Tango struct {
 	shutdown sync.Once
 	wg       sync.WaitGroup
 	started  atomic.Bool
+
+	// Stats tracking
+	statsSnapshot       atomic.Pointer[Stats]
+	statsUpdateInterval time.Duration
+
+	// Event handling
+	eventCh     chan Event
+	eventBuffer int
 }
 
 // New creates and initializes a new Tango instance with the provided options.
@@ -73,6 +95,7 @@ func New(opts ...Option) *Tango {
 		attemptToJoinFrequency:  defaultAttemptToJoinFrequency,
 		checkDeadlinesFrequency: defaultCheckDeadlinesFrequency,
 		defaultTimeout:          defaultTimeout,
+		statsUpdateInterval:     time.Second,
 
 		opCh:      make(chan operation),
 		timeoutCh: make(chan string),
@@ -87,6 +110,10 @@ func New(opts ...Option) *Tango {
 			return newMatch(Player{}, 0)
 		},
 	}
+
+	// Initialize stats snapshot
+	initialStats := &Stats{MatchesByGameMode: make(map[GameMode]GameModeStats)}
+	t.statsSnapshot.Store(initialStats)
 
 	for _, opt := range opts {
 		opt(&t)
@@ -105,9 +132,10 @@ func (t *Tango) Start() error {
 		t.matchWorkers = newMatchWorkerPool(defaultNumWorkers, defaultJobBufferSize, t)
 	}
 
-	t.wg.Add(2)
+	t.wg.Add(3)
 	go t.processOperations()
 	go t.processTimeouts()
+	go t.updateStats()
 
 	t.logger.Info("Tango started")
 	return nil
@@ -184,6 +212,7 @@ func (t *Tango) Enqueue(ctx context.Context, player Player) error {
 			if resp.err != nil {
 				return resp.err
 			}
+			t.logger.Info("Player enqueued", slog.String("player", player.String()))
 			return nil
 		case <-ctx.Done():
 			// Remove player if context is cancelled
@@ -193,6 +222,7 @@ func (t *Tango) Enqueue(ctx context.Context, player Player) error {
 				respCh:   make(chan response, 1),
 				doneCh:   done,
 			}
+			t.logger.Info("Enqueue operation cancelled", slog.String("player", player.String()))
 			return ctx.Err()
 		case <-time.After(t.defaultTimeout):
 			return fmt.Errorf("enqueue operation timed out")
@@ -233,6 +263,25 @@ func (t *Tango) RemovePlayer(playerID string) error {
 	t.opCh <- operation{op: opRemovePlayer, playerID: playerID, respCh: respCh}
 	resp := <-respCh
 	return resp.err
+}
+
+// Stats returns current statistics about matches and players
+func (t *Tango) Stats(ctx context.Context) (Stats, error) {
+	if !t.started.Load() {
+		return Stats{}, errServiceNotStarted
+	}
+
+	select {
+	case <-ctx.Done():
+		return Stats{}, ctx.Err()
+	case <-t.doneCh:
+		return Stats{}, errServiceNotStarted
+	default:
+		if snapshot := t.statsSnapshot.Load(); snapshot != nil {
+			return *snapshot, nil
+		}
+		return Stats{}, fmt.Errorf("stats not available")
+	}
 }
 
 // processOperations handles all state-modifying operations
@@ -464,4 +513,62 @@ func (t *Tango) cleanupMatchesAndPlayers(ctx context.Context) {
 			delete(t.state.players, playerID)
 		}
 	}
+}
+
+// Add new method to periodically update stats
+func (t *Tango) updateStats() {
+	defer t.wg.Done()
+	ticker := time.NewTicker(t.statsUpdateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			stats := t.collectStats()
+			t.statsSnapshot.Store(&stats)
+		case <-t.doneCh:
+			return
+		}
+	}
+}
+
+// Move stats collection to a separate method
+func (t *Tango) collectStats() Stats {
+	t.state.RLock()
+	stats := Stats{
+		MatchesByGameMode: make(map[GameMode]GameModeStats),
+		TotalMatches:      len(t.state.matches),
+		TotalPlayers:      len(t.state.players),
+	}
+
+	// Take a snapshot of matches to minimize lock time
+	matches := make([]*match, 0, len(t.state.matches))
+	for _, m := range t.state.matches {
+		matches = append(matches, m)
+	}
+	t.state.RUnlock()
+
+	// Initialize stats for each game mode
+	for mode := range AllGameModes {
+		stats.MatchesByGameMode[mode] = GameModeStats{}
+	}
+
+	// Process matches without holding the main lock
+	for _, m := range matches {
+		m.mu.RLock()
+		modeStats := stats.MatchesByGameMode[m.gameMode]
+		modeStats.ActiveMatches++
+		modeStats.OpenSlots += int(m.availableSlots)
+
+		var playerCount int
+		m.joinedPlayers.Range(func(_, _ interface{}) bool {
+			playerCount++
+			return true
+		})
+		modeStats.PlayersJoined += playerCount + 1 // +1 for host player
+
+		stats.MatchesByGameMode[m.gameMode] = modeStats
+		m.mu.RUnlock()
+	}
+	return stats
 }
