@@ -4,7 +4,7 @@
 
 ## ⚠️ Heads Up
 
-This is an **experimental** project. I built it to explore some ideas around matchmaking and concurrent patterns in Go. While it works, I wouldn't recommend using it in production *just yet*. Feel free to poke around and maybe grab some ideas for your own projects.
+This is an **experimental/toy** project. I built it to explore some ideas around matchmaking using concurrent patterns in Go. While it works, I wouldn't recommend using it in production. Feel free to poke around and maybe grab some ideas for your own projects.
 
 ## How Tango Works
 
